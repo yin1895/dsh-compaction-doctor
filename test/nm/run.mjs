@@ -1429,6 +1429,60 @@ test("engine: the single switch (probe row) actually reaches the engine", async 
   assert.equal(on.calls.compactIfNeeded.length, 1, "and the shipped backend is then consulted");
 });
 
+test("status: the switch is persisted by the plugin, never through the profile patch", async () => {
+  // The row is inserted by the bundle patch, so a profile-patch override would
+  // have to re-assert `name` and would replace the row's WHOLE config. The
+  // switch therefore lives in a file this plugin owns: it takes effect in memory
+  // at once (no hot reload needed) and survives a restart.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cdoc-switch-"));
+  const before = { home: process.env.DSH_HOME, profile: process.env.DSH_PROFILE };
+  process.env.DSH_HOME = home;
+  process.env.DSH_PROFILE = "desktop";
+  try {
+    const expected = path.join(home, "profiles", "desktop", "compaction-doctor.state.json");
+    assert.equal(probeMod.switchStateFile(), expected);
+    assert.equal(probeMod.readSwitchState(), undefined, "nothing on disk yet");
+
+    const session = makeSession(conversationEvents());
+    const ctx = makeCtx({
+      llm: fakeLlm,
+      tokenMeter: makeMeter(() => measurementOf(pricedNodes(20, 500), 10000)),
+      sessions: { active: () => session },
+    });
+    const doctor = new probeMod.CompactionDoctor(ctx, { fallbackContextWindow: 512000 });
+    assert.equal(doctor.config.enabled, false);
+    assert.equal((await doctor.stateSnapshot()).enabled, false);
+
+    const on = await doctor.setEnabled(true);
+    assert.equal(on.ok, true);
+    assert.equal(on.persisted, true, "the file was written");
+    assert.equal(doctor.config.enabled, true, "and memory changed at once");
+    assert.equal((await doctor.stateSnapshot()).enabled, true, "GET /state sees it with no reload");
+    assert.equal(probeMod.readSwitchState(), true, "it survives a restart");
+
+    // `PUT /config {"enabled":…}` must take the switch path in one shot — no
+    // profile patch, no hot reload. This is exactly what used to snap back.
+    const viaApi = await doctor.writeConfigPatch({ patch: { enabled: false } });
+    assert.equal(viaApi.ok, true, viaApi.error);
+    assert.deepEqual(viaApi.results.map((result) => result.route), ["switch-file"]);
+    assert.equal(doctor.config.enabled, false);
+    assert.equal((await doctor.stateSnapshot()).enabled, false);
+
+    assert.equal((await doctor.setEnabled("yes")).ok, false, "only booleans are accepted");
+    assert.equal(doctor.config.enabled, false, "a bad value changes nothing");
+
+    // A fresh instance prefers the stored switch over the row config.
+    const again = new probeMod.CompactionDoctor(ctx, { enabled: true });
+    assert.equal(again.config.enabled, false, "the stored switch wins over the row config");
+  } finally {
+    if (before.home === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = before.home;
+    if (before.profile === undefined) delete process.env.DSH_PROFILE;
+    else process.env.DSH_PROFILE = before.profile;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // run
 // ---------------------------------------------------------------------------

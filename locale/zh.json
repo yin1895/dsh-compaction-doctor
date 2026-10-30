@@ -4,6 +4,7 @@
   "switch.label": "自动校正长度设置",
   "state.loading": "正在读取设置…",
   "state.unavailable": "暂时读不到设置，退出这一栏再进来看看。",
+  "state.stale": "插件刚更新过，重启 DSH 之后这个开关才能用。",
   "auto.off": "未开启。DSH 使用它自己的默认设置。",
   "auto.none": "已开启。开始对话后会按你用的模型自动检查。",
   "auto.pending": "已开启。正在准备检查你当前用的模型…",

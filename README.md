@@ -177,15 +177,31 @@ curl.exe -s -o NUL -w "%{http_code}`n" "http://127.0.0.1:52616/plugins/@local/ds
 2. **只碰正在用的那一个**：只看当前会话正在使用的模型与它的提供商。其余已配置的提供商与模型**永远不会**被读、被定价、被改写——`discoverViaAdapter()` 只查 `route.provider` / `route.model`，`rewriteModelWindow()` 只改那一个模型行。
 3. **自动修正，先备份**：只有当「配置里的长度」与「上游真正接受过的 prompt」矛盾时才写，写前对 `cordis.patch.yml` 做逐字节备份，写完把 `contextWindow`/`maxTokens` 记进 `this.written`（否则紧接着的复查会读到旧值而误报失败），并写一行 DSH 日志。
 
-开关写的是 **probe 行的 `enabled`**，而引擎通过 `DOCTOR_OWNED_KEYS` 把 `enabled` 一并纳入配置分层，
-所以开关确实能同时管到「探测」和「压缩引擎」——回归测试 `engine: the single switch (probe row) actually reaches the engine` 钉死了这条。
+开关通过 `DOCTOR_OWNED_KEYS` 一并进入引擎的配置分层，
+所以它确实能同时管到「探测」和「压缩引擎」——回归测试 `engine: the single switch (probe row) actually reaches the engine` 钉死了这条。
 
 `autoRepair`（默认 `true`，不在页面上）是自动修正的总闸：置 `false` 就只查不写。
 `writeConfig` 只管 `/compact-doctor` 这条命令路径，与自动模式无关。
 
-### 4.2 视觉与生命周期约束
+### 4.2 开关存在哪里（以及为什么不是 profile 补丁）
 
-- 页面**不会白屏**：GET 失败 → 开关禁用 + 状态行灰字；PUT 失败 → 开关回到真实值。
+**`<profile>/compaction-doctor.state.json`**，插件自己的文件。不写 profile 补丁，原因有三条：
+
+1. doctor 那行是 **bundle 补丁插进来的**，profile 文件里根本没有这一行；要在 profile 里覆盖它，必须重写一条相同 `id` 的行，而 **`name` 是断言**（名字不匹配整行会被跳过）。
+2. 补丁按行**整体替换 `config`**（从不深合并），只写 `{"enabled":true}` 会把 `provider` / `entryId` / 各种上限一起抹掉。
+3. 写 profile 补丁要等**热重载**才生效，而热重载是异步的 —— 页面刚写完立刻回读就会读到旧值，表现成「开关自己弹回去」（v0.4.0 就是这个故障）。
+
+改成插件自己的文件之后：`setEnabled()` **先改内存**（`GET /state` 与引擎下一次读取立刻看到新值），再落盘（下次启动恢复）。落盘失败不影响本次会话，只在日志里记一句。
+所以现在 `PUT /config {"enabled":…}` 一次请求就闭环，页面不需要等热重载，也不该重试。
+
+> **⚠️ 改完文件必须重启 DSH。** 宿主半侧（`lib/probe.js` / `lib/engine.js` / `lib/status.js`）只在 **DSH 启动时** `import` 一次；
+> 「热重载」只对 **profile 补丁**生效，不会重新 `import` 插件代码。所以覆盖完文件后只刷新页面，会出现「新版页面 + 旧版宿主」的错配
+> （表现为开关点了没用、或状态行说读不到设置）。v0.4.1 的页面会把这个状态直接说出来：`插件刚更新过，重启 DSH 之后这个开关才能用。`
+
+### 4.3 视觉与生命周期约束
+
+- 页面**不会白屏**：读不到 → 开关禁用 + 状态行说明原因；写失败或超时 → 一次回读后开关恢复可点。
+- 开关**只允许在写请求在途时**短暂禁用，绝不允许出现永久点不动的开关。
 - 不硬编码背景/文字色（深浅主题都不会糊）；开关用官方语义 token。
 - 样式表用 `style[data-plugin-css]` 去重 + `data-plugin="<包名>"` 标记，插件卸载时被模块系统回收。
 - 本地化：状态行文案全在 `locale/{zh,en}.json`，宿主只给 `key + params`，所以英文界面下不会冒出中文句子。

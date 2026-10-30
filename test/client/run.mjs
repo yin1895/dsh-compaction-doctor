@@ -3,23 +3,21 @@
  *
  * No browser and no DSH process are needed. The script loads the bundle exactly the way the
  * web shell does — a classic script calling `window.__ModuleLoader__.load({ id, factory })` —
- * then checks the frozen contracts plus a render + switch-driving smoke test:
+ * then checks the frozen contracts plus a render + switch-driving smoke test.
  *
- *   static : syntax, no top-level ESM, one registration, package-name id, platform-seed-only
- *            `require`, `settings.section` options, exactly two request paths (state + config),
- *            no configuration-form channel, no interval timer, style-cleanup ownership,
- *            locale key parity, jargon/number-free copy;
- *   render : `apply(ctx)` registers one section; the component renders intro + the single
- *            switch + one status line, contains exactly one interactive control, and survives
- *            a dead transport;
- *   drive  : a fake transport walks the whole page — a mount reads state once, the status line
- *            follows the host key, flipping the switch writes exactly `{"enabled":…}`, the page
- *            re-reads until the hot-reloaded value shows, and a rejected write falls back to
- *            the host's real value instead of breaking the page.
+ * Because the switch is the whole page, the drive section doubles as the regression suite for
+ * the three shipped robustness rules:
+ *   - the switch is only ever disabled while a write is in flight, or while the host half is
+ *     still an older build (then clicking really is pointless);
+ *   - a write can never hang: it races a hard timeout, and every outcome ends with one
+ *     read-back that clears the busy state;
+ *   - read-backs are bounded (at most two retries, 300 ms apart, 3 s in total).
  *
  * Note on the harness: DSH mounts the section when the user selects it and unmounts it when
  * they leave, so `mount()` below is exactly that — a fresh component render plus its effects.
  * Between mounts the harness only re-renders, which is how React behaves with empty deps.
+ * Timers and `Date.now` are faked so the waits, the hard timeout and the retry budget are
+ * driven deterministically instead of by wall-clock time.
  *
  * Run: node test/client/run.mjs
  */
@@ -81,6 +79,11 @@ check("sends the route guard header", /x-compaction-doctor/iu.test(src));
 const fetchSites = [...src.matchAll(/\bfetch\s*\(/gu)].length;
 check("exactly one request entry point", fetchSites === 1, `fetch( count=${fetchSites}`);
 
+// Robustness constants must be the frozen ones, and the retry budget must be time-bounded.
+check("write timeout is the frozen hard limit", /WRITE_TIMEOUT_MS\s*=\s*8000\b/u.test(src));
+check("read-back budget is time-bounded, not count-only", /SETTLE_TOTAL_MS\s*=\s*3000\b/u.test(src) && /Date\.now\(\)/u.test(src));
+check("the wait before a read-back is 300ms", /SETTLE_MS\s*=\s*300\b/u.test(src));
+
 const pkgConstant = /var\s+PKG\s*=\s*['"]([^'"]+)['"]/u.exec(src);
 check("PKG constant equals the package name", pkgConstant?.[1] === pkg.name, String(pkgConstant?.[1]));
 check("style cleanup is owned by dataset.plugin = PKG", /dataset\.plugin\s*=\s*PKG\b/u.test(src));
@@ -100,7 +103,8 @@ check("the copy stays inside the key budget", zhKeys.length <= 14, `${zhKeys.len
 const AUTO_KEYS = ["off", "none", "pending", "running", "ok", "found", "fixed", "failed"].map((name) => `auto.${name}`);
 const missingAuto = AUTO_KEYS.filter((key) => !zhKeys.includes(key) || !enKeys.includes(key));
 check("every host status key has a localised line", missingAuto.length === 0, missingAuto.join(","));
-check("the status line keys exist", ["state.loading", "state.unavailable"].every((key) => zhKeys.includes(key)));
+check("the status line keys exist", ["state.loading", "state.unavailable", "state.stale"].every((key) => zhKeys.includes(key)));
+check("the older-host line is the mandated wording", zh["state.stale"] === "插件刚更新过，重启 DSH 之后这个开关才能用。", zh["state.stale"]);
 
 // The page must not explain itself with internal vocabulary, and shows no numbers at all.
 const BANNED = [
@@ -127,7 +131,11 @@ check("no field names in the copy", camel.length === 0, camel.join(","));
 // ── module registration + apply ──────────────────────────────────────────────
 const styleTags = [];
 const registrations = [];
-const timers = [];
+/** Fake timers with real ids, so `clearTimeout` (not just `setTimeout`) is exercised. */
+const timerMap = new Map();
+let timerSeq = 0;
+const clock = { now: Date.now() };
+
 const sandbox = {
   console,
   window: { __ModuleLoader__: { load: (registration) => registrations.push(registration) } },
@@ -137,15 +145,28 @@ const sandbox = {
     head: { appendChild: (tag) => styleTags.push(tag) },
     body: {},
   },
-  // Deterministic clock: the page waits before re-reading state, so the test drives the wait.
-  setTimeout: (fn) => timers.push(fn),
-  clearTimeout: () => {},
+  setTimeout: (fn, ms) => {
+    timerSeq += 1;
+    timerMap.set(timerSeq, { fn, ms });
+    return timerSeq;
+  },
+  clearTimeout: (id) => {
+    timerMap.delete(id);
+  },
   fetch: () => Promise.reject(new Error("offline")),
   navigator: {},
+  __clock: clock,
 };
 sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
+vm.runInContext("Date.now = function () { return __clock.now; };", sandbox);
 vm.runInContext(src, sandbox, { filename: "client.js" });
+
+const timerCount = () => timerMap.size;
+const timerDelays = () => [...timerMap.values()].map((entry) => entry.ms);
+const advance = (ms) => {
+  clock.now += ms;
+};
 
 check("registers exactly one module", registrations.length === 1, `count=${registrations.length}`);
 check("module id equals the package name", registrations[0]?.id === pkg.name, String(registrations[0]?.id));
@@ -266,12 +287,15 @@ const requests = [];
 const cleanups = [];
 const server = {
   auto: { key: "auto.off", params: {} },
-  // After a write the host hot-reloads; `stale` keeps serving the pre-write value for that
-  // many reads so the page's retry loop can be observed.
+  // `real` is the host's truth; `visible` is what a read returns (the host hot-reloads, so a
+  // read can lag behind); `stale` counts how many reads still answer with the old value.
   real: false,
   visible: false,
   stale: 0,
-  rejectWrite: false,
+  // 'ok' | 'http403' | 'okFalse' | 'hang' | 'network'
+  writeMode: "ok",
+  // an older host half: /state answers ok, but carries no `enabled` / `auto` fields at all
+  legacy: false,
 };
 const send = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
 sandbox.fetch = async (url, init) => {
@@ -280,18 +304,22 @@ sandbox.fetch = async (url, init) => {
   if (suffix === "/state") {
     if (server.stale > 0) server.stale -= 1;
     else server.visible = server.real;
+    if (server.legacy === true) return send(200, { ok: true, version: "0.3.0", unavailable: false });
     return send(200, {
       ok: true,
       enabled: server.visible,
       route: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash" },
       auto: server.visible === server.real && server.stale === 0 ? server.auto : { key: "auto.off", params: {} },
-      version: "0.4.0",
+      version: "0.4.1",
       unavailable: false,
     });
   }
   if (suffix === "/config") {
     const body = JSON.parse(String(init?.body ?? "{}"));
-    if (server.rejectWrite === true) return send(400, { ok: false, error: "write rejected" });
+    if (server.writeMode === "hang") return new Promise(() => {});
+    if (server.writeMode === "network") throw new Error("offline");
+    if (server.writeMode === "http403") return send(403, { ok: false, error: "forbidden" });
+    if (server.writeMode === "okFalse") return send(200, { ok: false, error: "write refused" });
     server.real = body.enabled === true;
     server.auto = server.real ? { key: "auto.pending", params: {} } : { key: "auto.off", params: {} };
     return send(200, { ok: true, config: { enabled: server.real }, hotReload: true });
@@ -300,9 +328,11 @@ sandbox.fetch = async (url, init) => {
 };
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
+/** Fire every armed timer once (the page's waits and its hard timeouts are all fake). */
 const fireTimers = () => {
-  const due = timers.splice(0, timers.length);
-  for (const fn of due) fn();
+  const due = [...timerMap.entries()];
+  timerMap.clear();
+  for (const [, entry] of due) entry.fn();
 };
 function render() {
   cursor = 0;
@@ -335,8 +365,16 @@ const nodesOf = (tree, type) => flatten(tree).filter((node) => node.type === typ
 const controls = (tree) => flatten(tree).filter((node) => node.type === "input" || node.type === "button");
 const statusOf = (tree) => flatten(tree).find((node) => node.props?.role === "status");
 const switchOf = (tree) => flatten(tree).find((node) => node.props?.role === "switch");
+const statusLine = (tree) => String(statusOf(tree)?.props.children ?? "");
 const stateGets = () => requests.filter((r) => r.kind === "http" && r.url.endsWith("/state") && r.method === "GET");
 const writes = () => requests.filter((r) => r.kind === "http" && r.method === "PUT");
+/** Bring a phase to rest: run every wait/timeout, let its promises settle, repeat. */
+async function settleAll(rounds = 6) {
+  for (let round = 0; round < rounds; round += 1) {
+    fireTimers();
+    await tick();
+  }
+}
 
 // ── render smoke test (dead transport) ───────────────────────────────────────
 // The very first paint happens before the read settles, so it must already be a usable page;
@@ -364,12 +402,8 @@ check(
 check("renders the intro sentence", flatten(mountTree).some((node) => node.props?.children === zh.intro));
 check("the page has exactly one interactive control", controls(mountTree).length === 1, String(controls(mountTree).length));
 check("the control is the switch and there are no buttons", switchOf(mountTree) !== undefined && nodesOf(mountTree, "button").length === 0);
-check("the switch starts disabled while nothing is known", switchOf(mountTree)?.props.disabled === true);
-check(
-  "the status line starts on the reading line",
-  statusOf(mountTree)?.props.children === zh["state.loading"],
-  String(statusOf(mountTree)?.props.children),
-);
+check("the switch is clickable from the very first paint", switchOf(mountTree)?.props.disabled === false);
+check("the status line starts on the reading line", statusLine(mountTree) === zh["state.loading"], statusLine(mountTree));
 
 // ── drive the page through the fake transport ────────────────────────────────
 async function drive() {
@@ -381,7 +415,7 @@ async function drive() {
   tree = render();
   check("mount reads the state exactly once", stateGets().length === 1, `gets=${stateGets().length}`);
   check("nothing polls in the background", stateGets().length === 1, `gets=${stateGets().length}`);
-  check("a switched-off host shows the off line", statusOf(tree)?.props.children === zh["auto.off"], String(statusOf(tree)?.props.children));
+  check("a switched-off host shows the off line", statusLine(tree) === zh["auto.off"], statusLine(tree));
   check("the switch follows the host value", switchOf(tree)?.props.checked === false && switchOf(tree)?.props.disabled === false);
   check("the switch carries its accessible state", switchOf(tree)?.props["aria-checked"] === "false", String(switchOf(tree)?.props["aria-checked"]));
 
@@ -396,46 +430,45 @@ async function drive() {
   tree = mount();
   await tick();
   tree = render();
-  const fixedLine = String(statusOf(tree)?.props.children);
-  check("the status line names the model the host fixed", fixedLine.includes("DeepSeek-V4.1-Flash"), fixedLine);
-  check("the status line says it was backed up", fixedLine.includes("已备份"), fixedLine);
-  check("the switch is on", switchOf(tree)?.props.checked === true && switchOf(tree)?.props["aria-checked"] === "true");
+  check("the status line names the model the host fixed", statusLine(tree).includes("DeepSeek-V4.1-Flash"), statusLine(tree));
+  check("the status line says it was backed up", statusLine(tree).includes("已备份"), statusLine(tree));
+  check("the switch is on and clickable", switchOf(tree)?.props.checked === true && switchOf(tree)?.props.disabled === false);
 
   // Phase 3 — the model is unknown: the sentence that would name it must disappear entirely.
   server.auto = { key: "auto.ok", params: {} };
   tree = mount();
   await tick();
   tree = render();
-  const bareModel = String(statusOf(tree)?.props.children);
-  check("an unknown model drops the whole sentence", bareModel === "已开启。", bareModel);
+  check("an unknown model drops the whole sentence", statusLine(tree) === "已开启。", statusLine(tree));
   check(
     "no empty bracket or raw key reaches the screen",
-    ["{", "}", "（）", "()", "auto.", "undefined"].every((token) => bareModel.includes(token) === false),
-    bareModel,
+    ["{", "}", "（）", "()", "auto.", "undefined"].every((token) => statusLine(tree).includes(token) === false),
+    statusLine(tree),
   );
 
-  // Phase 4 — flipping the switch off: exactly one write, exact body, re-read after the wait.
+  // Phase 4 — a clean flip: one write, and the read-back converges on the first try.
   server.auto = { key: "auto.pending", params: {} };
   tree = mount();
   await tick();
   tree = render();
-  const writesBefore = writes().length;
-  const getsBefore = stateGets().length;
+  const writesBeforeFlip = writes().length;
+  const getsBeforeFlip = stateGets().length;
   switchOf(tree)?.props.onChange?.({});
   await tick();
-  const offWrite = writes().at(-1);
-  check("flipping the switch writes exactly once", writes().length === writesBefore + 1, `delta=${writes().length - writesBefore}`);
-  check("the write body is exactly the enabled flag", String(offWrite?.body) === '{"enabled":false}', String(offWrite?.body));
+  check("flipping the switch writes exactly once", writes().length === writesBeforeFlip + 1, `delta=${writes().length - writesBeforeFlip}`);
+  check("the write body is exactly the enabled flag", String(writes().at(-1)?.body) === '{"enabled":false}', String(writes().at(-1)?.body));
   check("the switch is disabled while the write is in flight", switchOf(render())?.props.disabled === true);
-  check("the page waits before re-reading", stateGets().length === getsBefore, `delta=${stateGets().length - getsBefore}`);
+  check("the wait before the read-back is 300ms", timerDelays().join(",") === "300", timerDelays().join(","));
+  check("the page waits before re-reading", stateGets().length === getsBeforeFlip, `delta=${stateGets().length - getsBeforeFlip}`);
   fireTimers();
   await tick();
-  check("the page re-reads after the wait", stateGets().length === getsBefore + 1, `delta=${stateGets().length - getsBefore}`);
+  check("a converging read-back is not retried", stateGets().length === getsBeforeFlip + 1, `reads=${stateGets().length - getsBeforeFlip}`);
   tree = render();
   check("the switch shows the written value once the host agrees", switchOf(tree)?.props.checked === false && switchOf(tree)?.props.disabled === false);
-  check("the status line follows the host verdict", String(statusOf(tree)?.props.children) === zh["auto.off"], String(statusOf(tree)?.props.children));
+  check("the status line follows the host verdict", statusLine(tree) === zh["auto.off"], statusLine(tree));
+  check("no timer is left behind after a clean write", timerCount() === 0, `timers=${timerCount()}`);
 
-  // Phase 5 — the host still serves the pre-write value (hot reload in progress): retry.
+  // Phase 5 — the host still serves the pre-write value (hot reload in progress): retry, bounded.
   server.real = false;
   server.visible = false;
   server.stale = 0;
@@ -445,67 +478,156 @@ async function drive() {
   tree = render();
   server.stale = 2; // from here the host keeps answering with the value from before the write
   const writesBeforeStale = writes().length;
+  const getsBeforeStale = stateGets().length;
   switchOf(tree)?.props.onChange?.({});
   await tick();
   let reads = 0;
-  for (let round = 0; round < 4; round += 1) {
-    const before = stateGets().length;
+  for (let round = 0; round < 5; round += 1) {
     fireTimers();
     await tick();
-    reads += stateGets().length - before;
+    reads = stateGets().length - getsBeforeStale;
   }
   check("a stale read is retried until the hot reload lands", reads === 3, `reads=${reads}`);
   tree = render();
   check("the switch ends on the host's real value", switchOf(tree)?.props.checked === true, String(switchOf(tree)?.props.checked));
   check("the page writes once per flip, never per retry", writes().length === writesBeforeStale + 1, `delta=${writes().length - writesBeforeStale}`);
   check("the switch is usable again after the retries", switchOf(tree)?.props.disabled === false);
+  check("no timer is left behind after the retries", timerCount() === 0, `timers=${timerCount()}`);
 
-  // Phase 6 — a rejected write must not break the page: the switch falls back to the real value.
-  server.rejectWrite = true;
+  // Phase 6 — the 3s read-back budget: a host that never agrees must not be retried forever.
+  server.real = false;
+  server.visible = false;
+  server.stale = 1;
+  const getsBeforeBud = stateGets().length;
+  const writesBeforeBud = writes().length;
+  tree = render();
+  switchOf(tree)?.props.onChange?.({}); // off -> on
+  await tick();
+  server.stale = 20; // the host will never agree now
+  advance(4000); // blow the whole 3s budget before the first read-back even runs
+  await settleAll(4);
+  const budReads = stateGets().length - getsBeforeBud;
+  check("the read-back budget caps a host that never agrees", budReads === 1, `reads=${budReads}`);
+  check("the switch is released once the budget is blown", switchOf(render())?.props.disabled === false);
+  check("the page still wrote exactly once for that flip", writes().length === writesBeforeBud + 1, `delta=${writes().length - writesBeforeBud}`);
+  server.stale = 0;
+
+  // Phase 7 — a rejected write (403) reads the host back once and stays usable.
+  server.writeMode = "http403";
   server.real = true;
   server.visible = true;
-  server.stale = 0;
   server.auto = { key: "auto.pending", params: {} };
   tree = mount();
   await tick();
   tree = render();
   const writesBeforeReject = writes().length;
+  const getsBeforeReject = stateGets().length;
   switchOf(tree)?.props.onChange?.({});
   await tick();
-  const rejected = writes().at(-1);
-  check("the failed write was attempted", String(rejected?.body) === '{"enabled":false}', String(rejected?.body));
-  for (let round = 0; round < 4; round += 1) {
-    fireTimers();
-    await tick();
-  }
+  check("the failed write was attempted", String(writes().at(-1)?.body) === '{"enabled":false}', String(writes().at(-1)?.body));
+  await settleAll(4);
+  check("a rejected write reads the host back exactly once", stateGets().length - getsBeforeReject === 1, `reads=${stateGets().length - getsBeforeReject}`);
   tree = render();
   check("a rejected write leaves the page alive", statusOf(tree) !== undefined);
+  check("the busy state is released after a 403", switchOf(tree)?.props.disabled === false);
   check("the switch falls back to the host's real value", switchOf(tree)?.props.checked === true, String(switchOf(tree)?.props.checked));
-  check("the switch is usable again after the failure", switchOf(tree)?.props.disabled === false);
-  check("the page does not write again after a failure", writes().length === writesBeforeReject + 1, `delta=${writes().length - writesBeforeReject}`);
-  const afterFailure = String(statusOf(tree)?.props.children);
-  check(
-    "no raw error text leaks into the page",
-    afterFailure !== "" && ["error", "Error", "rejected", "fail"].every((token) => afterFailure.includes(token) === false),
-    afterFailure,
-  );
+  check("no raw error text leaks into the page", statusLine(tree) === zh["auto.pending"], statusLine(tree));
+  const writesBeforeRetry = writes().length;
+  switchOf(tree)?.props.onChange?.({});
+  await tick();
+  check("the switch works again after a failure", writes().length === writesBeforeRetry + 1, `delta=${writes().length - writesBeforeRetry}`);
+  await settleAll(4);
 
-  // Phase 7 — a dead host: the switch is disabled and the status line says so.
+  // Phase 8 — a write that answers 200 but ok:false behaves the same way.
+  server.writeMode = "okFalse";
+  server.auto = { key: "auto.pending", params: {} };
+  tree = mount();
+  await tick();
+  tree = render();
+  const getsBeforeOkFalse = stateGets().length;
+  switchOf(tree)?.props.onChange?.({});
+  await tick();
+  await settleAll(4);
+  check("an ok:false write reads the host back exactly once", stateGets().length - getsBeforeOkFalse === 1, `reads=${stateGets().length - getsBeforeOkFalse}`);
+  check("the busy state is released after ok:false", switchOf(render())?.props.disabled === false);
+
+  // Phase 9 — a network error on the write behaves the same way.
+  server.writeMode = "network";
+  tree = mount();
+  await tick();
+  tree = render();
+  const getsBeforeNet = stateGets().length;
+  switchOf(tree)?.props.onChange?.({});
+  await tick();
+  await settleAll(4);
+  check("a network error on the write reads the host back exactly once", stateGets().length - getsBeforeNet === 1, `reads=${stateGets().length - getsBeforeNet}`);
+  check("the busy state is released after a network error", switchOf(render())?.props.disabled === false);
+
+  // Phase 10 — a write that never resolves: the hard timeout must release the switch.
+  server.writeMode = "hang";
+  server.real = true;
+  server.visible = true;
+  server.auto = { key: "auto.pending", params: {} };
+  tree = mount();
+  await tick();
+  tree = render();
+  const writesBeforeHang = writes().length;
+  const getsBeforeHang = stateGets().length;
+  switchOf(tree)?.props.onChange?.({});
+  await tick();
+  check("the hung write armed the 8s hard timeout", timerDelays().join(",") === "8000", timerDelays().join(","));
+  check("the switch is disabled only while that write is in flight", switchOf(render())?.props.disabled === true);
+  fireTimers(); // the 8s hard timeout fires
+  await tick();
+  check("the timeout does not multiply read-backs", stateGets().length - getsBeforeHang <= 1, `reads=${stateGets().length - getsBeforeHang}`);
+  await settleAll(4);
+  check("a timed-out write reads the host back exactly once", stateGets().length - getsBeforeHang === 1, `reads=${stateGets().length - getsBeforeHang}`);
+  tree = render();
+  check("a timed-out write releases the switch", switchOf(tree)?.props.disabled === false);
+  check("the switch shows the host's real value after a timeout", switchOf(tree)?.props.checked === true, String(switchOf(tree)?.props.checked));
+  check("no timer is left behind after a timeout", timerCount() === 0, `timers=${timerCount()}`);
+  check("only one write was issued for the flip that timed out", writes().length === writesBeforeHang + 1, `delta=${writes().length - writesBeforeHang}`);
+
+  // Phase 11 — an older host half: ok, but with no switch value at all.
+  server.writeMode = "ok";
+  server.legacy = true;
+  tree = mount();
+  await tick();
+  tree = render();
+  check("an older host half is recognised", statusLine(tree) === zh["state.stale"], statusLine(tree));
+  check("the switch is disabled while the host half is old", switchOf(tree)?.props.disabled === true);
+  check("the older-host state is not mistaken for an off switch", switchOf(tree)?.props.checked === false);
+  server.legacy = false;
+  server.auto = { key: "auto.pending", params: {} };
+  tree = mount();
+  await tick();
+  tree = render();
+  check("a current host half leaves the switch clickable", switchOf(tree)?.props.disabled === false);
+  check("a current host half shows a normal status line", statusLine(tree) === zh["auto.pending"], statusLine(tree));
+
+  // Phase 12 — an unreachable host: readable status, and never a permanently dead switch.
   const workingFetch = sandbox.fetch;
   sandbox.fetch = async () => {
     throw new Error("offline");
   };
-  server.rejectWrite = false;
+  server.writeMode = "ok";
   tree = mount();
   await tick();
   tree = render();
-  check("an unreachable host disables the switch", switchOf(tree)?.props.disabled === true, String(switchOf(tree)?.props.disabled));
+  check("an unreachable host says so", statusLine(tree) === zh["state.unavailable"], statusLine(tree));
+  check("an unreachable host does NOT kill the switch", switchOf(tree)?.props.disabled === false);
+  const writesAfterOutage = writes().length;
+  sandbox.fetch = workingFetch; // the host comes back
+  switchOf(tree)?.props.onChange?.({});
+  await tick();
+  check("the switch still writes after an outage", writes().length === writesAfterOutage + 1, `delta=${writes().length - writesAfterOutage}`);
+  await settleAll(4);
+  tree = render();
   check(
-    "an unreachable host keeps a readable status line",
-    String(statusOf(tree)?.props.children) === zh["state.unavailable"],
-    String(statusOf(tree)?.props.children),
+    "the page recovers once the host answers again",
+    switchOf(tree)?.props.disabled === false && statusLine(tree) !== zh["state.unavailable"],
+    statusLine(tree),
   );
-  sandbox.fetch = workingFetch;
 
   // Transport shape over the whole run.
   const http = requests.filter((r) => r.kind === "http");
@@ -518,7 +640,13 @@ async function drive() {
   );
   const paths = [...new Set(http.map((r) => `${r.method} ${r.url.replace(ROUTE, "")}`))].sort();
   check("only the two frozen paths were used", paths.join(" | ") === "GET /state | PUT /config", paths.join(" | "));
+  check(
+    "every write body is exactly the enabled flag",
+    writes().every((r) => /^\{"enabled":(true|false)\}$/u.test(String(r.body))),
+    `${writes().length} writes`,
+  );
 
+  // Unmount must clear every timer the page armed.
   for (const off of cleanups) {
     try {
       off();
@@ -526,6 +654,7 @@ async function drive() {
       /* unmount noise */
     }
   }
+  check("unmount clears every armed timer", timerCount() === 0, `timers=${timerCount()}`);
 }
 await drive();
 

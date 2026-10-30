@@ -4,6 +4,7 @@
   "switch.label": "Correct length settings automatically",
   "state.loading": "Reading the settings…",
   "state.unavailable": "The settings could not be read — leave this section and come back in a moment.",
+  "state.stale": "The plugin was just updated — restart DSH before this switch can be used.",
   "auto.off": "Off. DSH uses its own defaults.",
   "auto.none": "On. Your model is checked automatically once you start a conversation.",
   "auto.pending": "On. Getting ready to check the model you are using…",

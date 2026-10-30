@@ -1,0 +1,40 @@
+# Disable the shipped compaction backend so exactly one service mounts as
+# `ctx.compaction`. The doctor engine extends `BasicCompactionEngine`, so the
+# class stays importable while its own row is off.
+- id: compaction-basic
+  name: '@deepseek-ai/dsh-compaction-basic'
+  disabled: true
+
+- insert:
+    # Upstream capability probe + config writer + diagnostic report.
+    - id: compaction-doctor
+      name: '@local/dsh-compaction-doctor/probe'
+      config:
+        enabled: true
+        provider: huaiyuan
+        model: DeepSeek-V4.1-Flash
+        providerEntryId: llm-pi-ai
+        probeOnStart: true
+        writeConfig: true
+        capMaxTokens: 65536
+        activeProbe: false
+        activeProbeConfirm: false
+        tokensPerByte: 0.34
+        scaleMode: meter
+        maxSummaryChunks: 8
+        summaryBudgetRatio: 0.9
+        selectRetainRatio: 0.05
+        writeWhenBusy: false
+
+    # Compaction engine: real-scale retention pricing + chunked summarization
+    # + overflow classification for provider errors the harness does not read.
+    - id: compaction-doctor-engine
+      name: '@local/dsh-compaction-doctor/engine'
+      config:
+        auto: true
+        thresholdRatio: 0.75
+        headroomTokens: 65536
+        retainRatio: 0.05
+        maxTokens: 65536
+        compactionRetries: 2
+        maxOverflowRetries: 2

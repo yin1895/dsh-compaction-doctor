@@ -23,6 +23,26 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const sourceLib = path.resolve(here, "..", "..", "lib");
 const localLib = path.join(here, "lib");
 
+/**
+ * Sandbox the whole run.
+ *
+ * `profileDir()` and everything built on it (`switchStateFile()`,
+ * `candidateProfilePatches()`, the backup writer) resolve through `$DSH_HOME`.
+ * Without this, a test that flips the switch — a real, supported operation —
+ * writes into whoever happens to be running the suite. Set before the first
+ * plugin import and never restored.
+ */
+const SANDBOX_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "cdoc-nm-home-"));
+process.env.DSH_HOME = SANDBOX_HOME;
+if (typeof process.env.DSH_PROFILE !== "string" || process.env.DSH_PROFILE.length === 0) process.env.DSH_PROFILE = "desktop";
+process.on("exit", () => {
+  try {
+    fs.rmSync(SANDBOX_HOME, { recursive: true, force: true });
+  } catch {
+    /* best effort */
+  }
+});
+
 fs.rmSync(localLib, { recursive: true, force: true });
 fs.mkdirSync(localLib, { recursive: true });
 for (const name of fs.readdirSync(sourceLib)) {
@@ -1522,6 +1542,51 @@ test("probe: every config merge is a lattice join, never a spread", () => {
   const normalized = probeMod.normalizeConfig({ enabled: true, provider: undefined, maxSummaryChunks: null });
   assert.equal(normalized.enabled, true);
   assert.equal(normalized.maxSummaryChunks, 8, "null is 'no opinion', not a value");
+});
+
+test("harness: no test can ever touch a real profile", () => {
+  // The switch is a real write path, so the suite has to be sandboxed or it
+  // writes into the machine that runs it. Asserted, not assumed.
+  assert.ok(SANDBOX_HOME.startsWith(os.tmpdir()), "the sandbox lives in the temp directory");
+  assert.equal(probeMod.profileDir().startsWith(SANDBOX_HOME), true, "profileDir is sandboxed");
+  assert.equal(probeMod.switchStateFile().startsWith(SANDBOX_HOME), true, "the switch file is sandboxed");
+  const doctor = new probeMod.CompactionDoctor(makeCtx({}), { fallbackContextWindow: 512000 });
+  assert.equal(doctor.config.enabled, false, "and a fresh sandbox starts with the switch off");
+});
+
+test("probe: nothing provider-specific is baked in — the row is found by provider", () => {
+  const text = PROFILE_PATCH.join("\n");
+  const byId = probeMod.rewriteModelWindow(text, { providerEntryId: "llm-pi-ai", provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 1048576, maxTokens: 65536 });
+  assert.equal(byId.changed, true, byId.reason);
+
+  // With no configured row id the row is located by the provider block it declares.
+  const located = probeMod.rewriteModelWindow(text, { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 1048576, maxTokens: 65536 });
+  assert.equal(located.changed, true, located.reason);
+  assert.equal(located.text, byId.text, "locating by provider and by row id agree byte for byte");
+
+  // A stale id must not stop the search: the id is a hint, the provider is the fact.
+  const wrongId = probeMod.rewriteModelWindow(text, { providerEntryId: "no-such-row", provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 1048576, maxTokens: 65536 });
+  assert.equal(wrongId.changed, true, "a hint that misses must not defeat the provider search");
+  assert.equal(wrongId.text, byId.text);
+
+  // An unknown provider is reported, never guessed.
+  const missing = probeMod.rewriteModelWindow(text, { provider: "no-such-provider", model: "DeepSeek-V4.1-Flash", contextWindow: 1, maxTokens: 1 });
+  assert.equal(missing.changed, false);
+  assert.match(missing.reason, /no-such-provider/);
+
+  // And no deployment-specific value survives as a default.
+  const defaults = probeMod.normalizeConfig({});
+  for (const key of ["provider", "model", "providerEntryId", "apiKeyEnv", "baseURL"]) {
+    assert.equal(defaults[key], undefined, `${key} must not be baked in`);
+  }
+  assert.equal(probeMod.normalizeConfig({ providerEntryId: "" }).providerEntryId, undefined, "an empty id means 'locate it for me'");
+
+  // The shipped patch carries the overrides as comments only.
+  const shipped = fs.readFileSync(path.resolve(here, "..", "..", "cordis.patch.yml"), "utf8");
+  const row = shipped.slice(shipped.indexOf("id: compaction-doctor\n"), shipped.indexOf("id: compaction-doctor-engine"));
+  for (const key of ["provider", "model", "providerEntryId", "apiKeyEnv"]) {
+    assert.equal(new RegExp(`^\\s*${key}\\s*:`, "m").test(row), false, `the shipped patch must not pin ${key}`);
+  }
 });
 
 // ---------------------------------------------------------------------------

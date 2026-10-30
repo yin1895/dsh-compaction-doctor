@@ -3,7 +3,16 @@
   "version": "0.4.1",
   "private": true,
   "type": "module",
-  "description": "DSH 上下文压缩诊断与修复插件：探测路由真实可用窗口、在设置页里用几个按钮完成「诊断 → 修复 → 状态监控 → 回滚」，并从装配缝上修好压缩（真实尺度保留定价、分块摘要、非英文溢出报错识别）。",
+  "description": "DSH 上下文压缩插件：设置里一个开关，打开后按你正在使用的模型自动校正上下文长度配置（改前逐字节备份）；关掉即完全惰性。",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yin1895/dsh-compaction-doctor.git"
+  },
+  "homepage": "https://github.com/yin1895/dsh-compaction-doctor#readme",
+  "bugs": {
+    "url": "https://github.com/yin1895/dsh-compaction-doctor/issues"
+  },
   "icon": "icon.svg",
   "keywords": [
     "dsh",
@@ -35,6 +44,8 @@
     "locale",
     "icon.svg",
     "cordis.patch.yml",
+    "docs",
+    "LICENSE",
     "README.md"
   ],
   "dsh": {

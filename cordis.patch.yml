@@ -47,10 +47,14 @@
         # `autoRepair` (below) can only ever run while this is true.
         enabled: false
         autoRepair: true
-        # Fallback route for a brand-new session; a live `request/context` wins.
-        provider: huaiyuan
-        model: DeepSeek-V4.1-Flash
-        providerEntryId: llm-pi-ai
+        # Optional overrides — leave them out and the plugin follows the model the
+        # session is actually talking to, locating the row to rewrite by that
+        # provider rather than by a hard-coded profile row id.
+        #
+        #   provider: <name>          # fallback route for a brand-new session
+        #   model: <name>             # (a live request/context always wins)
+        #   providerEntryId: <row id> # only if your provider row must be picked
+        #   apiKeyEnv: <ENV VAR>      # only if the row does not declare its own
         engineEntryId: compaction-doctor-engine
         writeConfig: false
         overflowRecovery: true

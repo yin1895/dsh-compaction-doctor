@@ -219,6 +219,17 @@ async function makeHostRoot(services = {}) {
 }
 
 const HOME_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "cdoc-home-"));
+// Belt and braces: anything that forgets to call `useHome()` still lands inside
+// the temp tree instead of the profile of whoever runs the checker.
+process.env.DSH_HOME = HOME_ROOT;
+process.env.DSH_PROFILE = "model-test";
+process.on("exit", () => {
+  try {
+    fs.rmSync(HOME_ROOT, { recursive: true, force: true });
+  } catch {
+    /* best effort */
+  }
+});
 let HOME_SEQ = 0;
 function useHome(label) {
   HOME_SEQ += 1;

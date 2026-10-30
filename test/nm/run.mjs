@@ -36,6 +36,7 @@ const rescale = await import("./lib/rescale.js");
 const overflowMod = await import("./lib/overflow.js");
 const engineMod = await import("./lib/engine.js");
 const probeMod = await import("./lib/probe.js");
+const statusMod = await import("./lib/status.js");
 const surfaceMod = await import("./lib/index.js");
 
 // ---------------------------------------------------------------------------
@@ -101,6 +102,21 @@ function makeCtx(services = {}) {
         if (result !== undefined && result !== null) return result;
       }
       return undefined;
+    },
+    /**
+     * Emit a non-waterfall event with its real host arity.
+     *
+     * `session/event` listeners receive `(session, event)` — the authoritative
+     * shape used by `dsh-compaction-basic/lib/index.js:856`. A single-parameter
+     * harness would silently keep a listener that reads the session object as
+     * if it were the event, which is exactly the defect this harness guards.
+     */
+    async emitEvent(type, ...args) {
+      let result;
+      for (const handler of listeners.get(type) ?? []) {
+        result = await handler(...args);
+      }
+      return result;
     },
   };
   for (const [name, value] of Object.entries(services)) {
@@ -739,8 +755,14 @@ test("engine: branded overflow codes, aborted signals and exhausted budgets fall
   assert.deepEqual(await ctxEx.emit("agent/request-error", { agent, failure: DASHSCOPE_400 }), { kind: "retry" });
   assert.equal(await ctxEx.emit("agent/request-error", { agent, failure: DASHSCOPE_400 }), undefined, "the retry budget is spent");
   assert.equal(exhausted._overflowRetries.get(agent), 1);
-  await ctxEx.emit("session/event", { agent, event: { type: "assistant/message" } });
+  // Authoritative host shape: `ctx.on("session/event", (session, event) => …)`.
+  await ctxEx.emitEvent("session/event", session, { type: "assistant/message" });
   assert.equal(exhausted._overflowRetries.get(agent), undefined, "a delivered message resets the budget");
+  // A single-parameter listener would keep the budget: the session object is not
+  // the event, so `event.type` is undefined and the reset never happens.
+  exhausted._overflowRetries.set(agent, 1);
+  await ctxEx.emitEvent("session/event", { agent, event: { type: "assistant/message" } }, undefined);
+  assert.equal(exhausted._overflowRetries.get(agent), 1, "the legacy single-argument payload must not reset the budget");
 });
 
 // ---------------------------------------------------------------------------
@@ -891,6 +913,163 @@ test("probe service: report text renders every decision line", () => {
 });
 
 // ---------------------------------------------------------------------------
+// probe: event contracts (regressions for the 0.1.0 turn-killing bug)
+// ---------------------------------------------------------------------------
+
+test("probe: the pre-step listener forwards the waterfall instead of vetoing it", async () => {
+  // `agent/pre-step` is a **waterfall**: `cordis/lib/index.js:317-325` returns the
+  // OUTERMOST listener's value, and a listener that neither returns a decision
+  // nor calls `next()` vetoes the rest of the chain, including the built-in
+  // `{ kind: "enter" }` fallback. The consumers then read `decision.kind` on
+  // `undefined` (dsh-agent/lib/index.js:195 and dsh-agent-loop/lib/index.js:930)
+  // and the whole turn dies with
+  // "Cannot read properties of undefined (reading 'kind')".
+  const session = makeSession(conversationEvents());
+  const commands = { registrations: [], register(registration) { commands.registrations.push(registration); return { dispose() {} }; } };
+  const ctx = makeCtx({ llm: fakeLlm, sessions: { active: () => session }, commands });
+  const doctor = new probeMod.CompactionDoctor(ctx, {
+    enabled: true,
+    probeOnStart: false,
+    writeConfig: false,
+    baseURL: "http://127.0.0.1:1/v1",
+  });
+  assert.equal(doctor._lateHookInstalled, true, "the late command hook is installed");
+  const builtin = async () => ({ kind: "enter", messages: [] });
+  const decision = await ctx.emit(
+    "agent/pre-step",
+    { agent: makeAgent(session), signal: undefined, messages: [], turn: 1, step: 1 },
+    builtin,
+  );
+  assert.deepEqual(decision, { kind: "enter", messages: [] }, "the built-in fallback must be reached");
+});
+
+test("probe: a row Config with volatile fields is what makes the settings namespace", async () => {
+  // `ctx.settings.describe()` only projects a row whose schemastery Config carries
+  // at least one `.volatile()` field; without one the row is invisible to the
+  // settings page and writes fail with "has no volatile fields".
+  const schema = probeMod.CompactionDoctor.Config;
+  assert.equal(schema?._type, "object");
+  const dict = schema._meta.dict;
+  const volatile = Object.entries(dict).filter(([, node]) => node?._meta?.volatile === true).map(([key]) => key);
+  for (const key of ["enabled", "writeConfig", "scaleMode", "probeOnStart", "capMaxTokens"]) {
+    assert.ok(volatile.includes(key), `${key} is page-editable`);
+  }
+  assert.equal(dict.writeConfig._meta.default, false, "a discovered window is never written on startup");
+  assert.ok(Object.keys(dict).includes("provider"), "the row still accepts the route fallback");
+  assert.ok(Object.keys(dict).includes("providerEntryId"), "the row still accepts the provider entry id");
+});
+
+// ---------------------------------------------------------------------------
+// settings-page transport (lib/status.js): the gates are the only thing standing
+// between a zero-auth webServer and cross-site writes
+// ---------------------------------------------------------------------------
+
+test("status: the endpoint table matches the frozen contract", () => {
+  assert.equal(statusMod.matchRoute("GET", "/state"), "state");
+  assert.equal(statusMod.matchRoute("POST", "/diagnose"), "diagnose");
+  assert.equal(statusMod.matchRoute("POST", "/apply"), "apply");
+  assert.equal(statusMod.matchRoute("GET", "/config"), "config");
+  assert.equal(statusMod.matchRoute("PUT", "/config"), "writeConfig");
+  assert.equal(statusMod.matchRoute("GET", "/backups"), "backups");
+  assert.equal(statusMod.matchRoute("POST", "/restore"), "restore");
+  assert.equal(statusMod.matchRoute("GET", ""), undefined, "the bare prefix has no endpoint");
+  assert.equal(statusMod.matchRoute("DELETE", "/state"), undefined, "the method is part of the key");
+  assert.equal(statusMod.matchRoute("POST", "/state"), undefined, "state is read-only");
+  // Write endpoints require a JSON body; reads do not.
+  for (const name of ["diagnose", "apply", "writeConfig", "restore"]) assert.equal(statusMod.requiresJsonBody(name), true, name);
+  for (const name of ["state", "config", "backups"]) assert.equal(statusMod.requiresJsonBody(name), false, name);
+});
+
+test("status: every request gate rejects the request it is supposed to", () => {
+  const header = "x-compaction-doctor";
+  const prefix = "/dsh-compaction-doctor";
+  const base = { url: `${prefix}/state`, headers: { host: "127.0.0.1:18532" } };
+  assert.match(statusMod.guardRequest(base, header, prefix), /missing x-compaction-doctor header/u);
+  assert.equal(
+    statusMod.guardRequest({ ...base, headers: { ...base.headers, [header]: "1", "sec-fetch-site": "same-origin" } }, header, prefix),
+    undefined,
+    "same-origin with the guard header passes",
+  );
+  assert.match(
+    statusMod.guardRequest({ ...base, headers: { ...base.headers, [header]: "1", "sec-fetch-site": "cross-site" } }, header, prefix),
+    /cross-site/u,
+  );
+  assert.match(
+    statusMod.guardRequest({ ...base, headers: { ...base.headers, [header]: "1", origin: "https://evil.example" } }, header, prefix),
+    /does not match host/u,
+  );
+  assert.equal(
+    statusMod.guardRequest(
+      { ...base, headers: { ...base.headers, [header]: "1", origin: "http://127.0.0.1:18532" } },
+      header,
+      prefix,
+    ),
+    undefined,
+    "a matching Origin passes",
+  );
+  assert.match(
+    statusMod.guardRequest({ ...base, url: "/api/other", headers: { ...base.headers, [header]: "1" } }, header, prefix),
+    /outside route prefix/u,
+  );
+});
+
+test("status: setRowConfigKeys rewrites one row's config in place and leaves every other byte alone", () => {
+  const document = [
+    "# leading comment stays",
+    "- id: llm-pi-ai",
+    "  name: '@deepseek-ai/dsh-llm-pi-ai'",
+    "  config:",
+    "    providers:",
+    "      huaiyuan:",
+    "        apiKeyEnv: HUAIYUAN_API_KEY",
+    "",
+    "- insert:",
+    "    - id: compaction-doctor",
+    "      name: '@local/dsh-compaction-doctor/probe'",
+    "      config:",
+    "        enabled: true",
+    "        writeConfig: false",
+    "",
+    "    - id: compaction-doctor-engine",
+    "      name: '@local/dsh-compaction-doctor/engine'",
+    "",
+  ].join("\n");
+  const replaceOnly = statusMod.setRowConfigKeys(document, "compaction-doctor", { writeConfig: true });
+  assert.equal(replaceOnly.changed, true);
+  assert.match(replaceOnly.text, /^ {8}writeConfig: true$/mu, "the existing key is replaced at its own indent");
+  assert.ok(replaceOnly.text.includes("enabled: true"), "sibling keys survive");
+  assert.ok(replaceOnly.text.includes("# leading comment stays"), "unrelated lines are byte-identical");
+  assert.ok(replaceOnly.text.includes("apiKeyEnv: HUAIYUAN_API_KEY"), "another row's config is untouched");
+
+  const withInsert = statusMod.setRowConfigKeys(replaceOnly.text, "compaction-doctor", { scaleMode: "select" });
+  assert.equal(withInsert.changed, true);
+  assert.match(withInsert.text, /^ {8}scaleMode: select$/mu, "a missing key is inserted inside the same block");
+
+  const created = statusMod.setRowConfigKeys(document, "compaction-doctor-engine", { auto: false });
+  assert.equal(created.changed, true);
+  assert.match(created.text, /name: '@local\/dsh-compaction-doctor\/engine'\n {6}config:\n {8}auto: false/u, "a config block is created after name");
+
+  const missing = statusMod.setRowConfigKeys(document, "no-such-row", { auto: false });
+  assert.equal(missing.changed, false);
+  assert.equal(missing.text, document, "an unknown row is a no-op");
+  assert.match(missing.reason, /not found/u);
+
+  const same = statusMod.setRowConfigKeys(document, "compaction-doctor", { writeConfig: false });
+  assert.equal(same.changed, false, "writing the same value is a no-op");
+  assert.equal(same.text, document);
+});
+
+test("status: renderScalar quotes only what YAML needs", () => {
+  assert.equal(statusMod.renderScalar(true), "true");
+  assert.equal(statusMod.renderScalar(0.05), "0.05");
+  assert.equal(statusMod.renderScalar("meter"), "meter");
+  assert.equal(statusMod.renderScalar("llm-pi-ai"), "llm-pi-ai");
+  assert.equal(statusMod.renderScalar("DeepSeek-V4.1-Flash"), "DeepSeek-V4.1-Flash");
+  assert.equal(statusMod.renderScalar("a b"), '"a b"');
+  assert.equal(statusMod.renderScalar("a: b"), '"a: b"');
+});
+
+// ---------------------------------------------------------------------------
 // bundle surface
 // ---------------------------------------------------------------------------
 
@@ -924,6 +1103,23 @@ test("bundle: index.js exposes every documented entry point", () => {
     "latestRoute",
     "estimateTokens",
     "readContextWindow",
+    // v0.2 settings-page surface
+    "VERSION",
+    "ROUTE_PREFIX",
+    "ROUTE_GUARD_HEADER",
+    "BACKUP_TAG",
+    "ENGINE_ROW_KEYS",
+    "profileDir",
+    "listPatchBackups",
+    "isBackupInside",
+    "guardRequest",
+    "installStatusRoute",
+    "matchRoute",
+    "readJsonBody",
+    "renderScalar",
+    "requiresJsonBody",
+    "sendJson",
+    "setRowConfigKeys",
   ];
   for (const name of expected) {
     const value = surfaceMod[name];

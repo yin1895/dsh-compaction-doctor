@@ -1,3 +1,13 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# @local/dsh-compaction-doctor — bundle patch (v0.2)
+#
+# Layering: this patch is applied after the shipped bundle stack, so overriding a
+# shipped row by id wins over its own defaults, and the profile's own
+# `cordis.patch.yml` still wins over this file. A patch replaces a row's whole
+# `config` (never merges into it), and `name` is an assertion: a mismatched name
+# makes the whole row be skipped instead of remounted.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Disable the shipped compaction backend so exactly one service mounts as
 # `ctx.compaction`. The doctor engine extends `BasicCompactionEngine`, so the
 # class stays importable while its own row is off.
@@ -6,16 +16,25 @@
   disabled: true
 
 - insert:
-    # Upstream capability probe + config writer + diagnostic report.
+    # Upstream capability probe + settings-page transport + diagnostic report.
+    #
+    # This row's Config is marked `.volatile()`, which is what makes it a
+    # settings namespace: the browser reads and writes these fields through
+    # `ctx.configForms.get('compaction-doctor')` with no registration step.
+    # `writeConfig` defaults to false on purpose — a discovered value is only
+    # written when the user presses 「一键修复」, never on startup.
     - id: compaction-doctor
       name: '@local/dsh-compaction-doctor/probe'
       config:
         enabled: true
+        # Fallback route for a brand-new session; a live `request/context` wins.
         provider: huaiyuan
         model: DeepSeek-V4.1-Flash
         providerEntryId: llm-pi-ai
+        engineEntryId: compaction-doctor-engine
         probeOnStart: true
-        writeConfig: true
+        writeConfig: false
+        overflowRecovery: true
         capMaxTokens: 65536
         activeProbe: false
         activeProbeConfirm: false
@@ -23,11 +42,13 @@
         scaleMode: meter
         maxSummaryChunks: 8
         summaryBudgetRatio: 0.9
-        selectRetainRatio: 0.05
+        selectCapRatio: 0.85
         writeWhenBusy: false
 
-    # Compaction engine: real-scale retention pricing + chunked summarization
-    # + overflow classification for provider errors the harness does not read.
+    # Compaction engine: real-scale retention pricing + chunked hierarchical
+    # summarization + overflow classification for provider errors the harness
+    # does not decode. Policy keys here are consumed and frozen by the shipped
+    # base class, so they change only by rewriting this row (which hot-reloads).
     - id: compaction-doctor-engine
       name: '@local/dsh-compaction-doctor/engine'
       config:

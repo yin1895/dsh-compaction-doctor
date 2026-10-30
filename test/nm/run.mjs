@@ -1273,14 +1273,16 @@ test("bundle: the patch keeps a bare-name row so the browser half is discovered"
 });
 
 test("status: the plain verdict is plain language, and leaks no internal vocabulary", () => {
-  // This is the ONLY text a user reads on the settings page: one sentence plus up
-  // to three detail lines. It must stay readable to someone who has never heard
-  // of scaling, shadowing, budgets or headroom.
+  // `text` is the plain-language fallback carried by the JSON snapshot; the page
+  // itself localizes `key` + `params`. Either way it must stay readable to
+  // someone who has never heard of scaling, shadowing, budgets or headroom — and
+  // it must never mention a control the page does not have.
   const doctor = new probeMod.CompactionDoctor(makeCtx({}), { enabled: true, writeConfig: false });
 
   const unknown = doctor._plainView(undefined);
   assert.equal(unknown.level, "unknown");
-  assert.match(unknown.text, /点「检查」/u);
+  assert.match(unknown.text, /打开开关/u, "the unknown sentence points at the switch");
+  assert.equal(/按钮|点「|点击/.test(unknown.text), false, "and never at a button that no longer exists");
 
   const ok = doctor._plainView({
     configured: { contextWindow: 1048576, maxOutput: 65536 },

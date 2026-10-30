@@ -120,8 +120,15 @@ D:\dsh-compaction-doctor\
 
 | 行 id | 模块 | 配置属于谁 |
 |---|---|---|
-| `compaction-doctor` | `.../probe` | **诊断类**字段，全在 `Config` 里标了 `.volatile()` ⇒ 这就是那个设置命名空间，页面可直接读写 |
-| `compaction-doctor-engine` | `.../engine` | **压缩策略**字段（`auto` / `thresholdRatio` / `headroomTokens` / `retainRatio` / `maxTokens` / `compactionRetries` / `maxOverflowRetries`）。它们被随包基类 `deepFreeze` 进 `this.config`，改它等于重写该行 `config`，靠热重载生效 |
+| `compaction-doctor` | `.../probe` | **诊断类**字段 + 页面可编辑的 `thresholdRatio` / `retainRatio`，全部在 `Config` 里标了 `.volatile()` ⇒ 这就是那个设置命名空间，页面可直接读写 |
+| `compaction-doctor-engine` | `.../engine` | **压缩策略**字段（`auto` / `thresholdRatio` / `headroomTokens` / `retainRatio` / `maxTokens` / `compactionRetries` / `maxOverflowRetries`）。它们被随包基类 `deepFreeze` 进 `this.config`，所以改它只能重写该行 `config` 并靠热重载生效 |
+
+**阈值比 / 保留比的优先级**（这是唯一一个两行都有的键，必须说清）：
+
+1. 页面（probe 行）的值与引擎行的值**相同**（全新安装就是这样）⇒ 随包路径原样运行，行为零变化。
+2. 两者**不同** ⇒ 引擎切到自己的选择路径，用页面的数字重新定价与选头（因为 `this.config` 冻结了，改不动它）。
+3. 引擎行仍然负责 `auto` / `headroomTokens` / `maxTokens` / `compactionRetries` / `maxOverflowRetries`——
+   这些没有页面入口，改动要么用 `PUT /config`，要么直接编辑 profile patch。
 
 诊断类字段的优先级：`DOCTOR_DEFAULTS` < 引擎行 `config` < probe 行 `config`（probe 行话事）。
 

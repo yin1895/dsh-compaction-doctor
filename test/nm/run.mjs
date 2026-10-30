@@ -596,6 +596,26 @@ test("engine: meter mode hands the shipped backend a real-scale surface (the k-d
   assert.equal(meter.measure(session), raw, "the scale patch is released when the compaction finishes");
 });
 
+test("engine: a page-edited budget switches to the local selection path", async () => {
+  // `this.config` is `deepFreeze`d by the shipped base class at mount, so a
+  // settings-page edit cannot mutate it. When the page value differs from the
+  // row value the engine must use its own selection path, otherwise the edit is
+  // a silent no-op. On a fresh install the two agree and the shipped path runs.
+  const ctx = makeCtx({ llm: fakeLlm, tokenMeter: makeMeter(() => measurementOf(pricedNodes(20, 500), 10000)), sessions: {} });
+  const engine = new engineMod.CompactionDoctorEngine(ctx, {
+    enabled: true,
+    scaleMode: "meter",
+    thresholdRatio: 0.75,
+    retainRatio: 0.05,
+  });
+  assert.equal(engine.doctorConfig().thresholdRatio, 0.75, "the row value is the doctor default");
+  assert.equal(engine._doctorOverridesBudgets({ thresholdRatio: 0.75, retainRatio: 0.05 }), false, "same values: stock path");
+  assert.equal(engine._doctorOverridesBudgets({ thresholdRatio: 0.9, retainRatio: 0.05 }), true, "page edit: local path");
+  assert.equal(engine._doctorOverridesBudgets({ retainRatio: 0.2 }), true, "either key is enough");
+  assert.equal(engine._doctorOverridesBudgets({}), false, "no page values: stock path");
+  assert.equal(engine._doctorOverridesBudgets({ thresholdRatio: 0.75 }), false, "undefined row value never diverges");
+});
+
 test("engine: select mode shadows a real-scale head and never asks the summarizer for more than the budget", async () => {
   const raw = measurementOf(pricedNodes(200, 233), 930386);
   const meter = makeMeter(() => raw);

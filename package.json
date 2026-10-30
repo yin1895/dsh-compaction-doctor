@@ -27,7 +27,8 @@
   "scripts": {
     "test": "node test/nm/run.mjs",
     "test:client": "node test/client/run.mjs",
-    "test:all": "node test/nm/run.mjs && node test/client/run.mjs"
+    "test:model": "node test/model/check.mjs",
+    "test:all": "node test/nm/run.mjs && node test/client/run.mjs && node test/model/check.mjs"
   },
   "files": [
     "lib",

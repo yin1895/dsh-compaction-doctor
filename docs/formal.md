@@ -57,7 +57,7 @@ defaults  <  engineRow  <  probeRow  <  store
 |---|---|
 | **I1** | 开关不可点 ⇒ `P=1 ∨ F=1`（只有两个原因；`E∈{⊤,⊥}` 且 `P=0` 时必须可点） |
 | **I2** | `P=1` 是有界的：从任意状态出发，在 `≤ 8000 + 3000` 毫秒虚拟时间且无新写的情况下必然到达 `P=0` |
-| **I3** | 显示一致性：最后一次读成功并报告 `b` 之后，`E=b`，除非此刻正有一次乐观写在途（`P=1`） |
+| **I3** | 显示一致性：最后一次读成功并报告 `b` 之后，`E=b`，除非此刻正有一次乐观写在途（`P=1`）；**豁免**：读取从未成功过（`V=failed`）时 `E=∅` 不算说谎 |
 | **I4** | 收敛性：`write_ok` 之后的回读序列结束时，`E` 等于宿主最后报告的值（页面不可能长期说谎） |
 | **I5** | 读有界：一次点击引发的读次数 `≤ 1+R₀`（`R₀≤2`）；若首次回读即一致则 `=1` |
 | **I6** | 计时器卫生：静默态（`P=0` 且无在途回读）下已挂载的计时器数 `=0` |
@@ -65,6 +65,7 @@ defaults  <  engineRow  <  probeRow  <  store
 | **I8** | 存储忠实性：`readSwitchState() ∈ {undefined, ⊤, ⊥}`，且 `undefined` 表示"无意见"，**不得**被当作 `⊥`；写入是原子的（任一单点故障后，存储是旧值或新值，不存在半截 JSON） |
 | **I9** | 优先级定理：若 `store` 给出布尔值，则有效值 = `store`（用户的点击是格的唯一极大元） |
 | **I10** | 引擎可见性：`enabled ∈ DOCTOR_OWNED_KEYS` ⇒ 开关的变化在同一进程内立即被 `CompactionDoctorEngine.doctorConfig()` 读到（不需要重启） |
+| **I11** | 合并是格并：任意层级合并处，**「无意见」不得覆盖**。形式地，`merge(a,b)[k] = b[k]` 当 `b[k] ∈ {undefined, null}` 时必须等于 `a[k]`。对象展开 `{...a,...b}` **不满足**此性质（`{...{a:1},...{a:undefined}}` 得 `a=undefined`），因此每一处合并必须用 `mergeDefined()` |
 
 ---
 
@@ -74,7 +75,7 @@ defaults  <  engineRow  <  probeRow  <  store
 
 **I2**：写入由 `guard(request, WRITE_TIMEOUT_MS=8000)` 包裹，`guard` 在计时器到点时强制兑现结果；兑现路径（成功/失败/超时）统一进入回读，回读本身也被 `guard` 包裹且带 `SETTLE_TOTAL_MS=3000` 的总时限，回读的每个出口都执行 `setPending(false)`。两条时限都只依赖于 `tick`，与网络无关 ⇒ 上界 `8000+3000`。∎
 
-**I3**：`applyState(b)` 是 `E` 的唯一非乐观写入口（除 `click` 的乐观置值），且它只在 `res.ok===true ∧ enabled∈{⊤,⊥}` 时调用。`click` 只把 `E` 置为 `¬E` 并同时置 `P=1`，故例外项恰为 `P=1`。∎
+**I3**：`applyState(b)` 是 `E` 的唯一非乐观写入口（除 `click` 的乐观置值），且它只在 `res.ok===true ∧ enabled∈{⊤,⊥}` 时调用。`click` 只把 `E` 置为 `¬E` 并同时置 `P=1`，故例外项恰为 `P=1`。第二条豁免由检验器发现：读从未成功时 `E=∅`（页面显示"读不到"），此时显示的不是任何**宿主报告过的值**，按字面定义会被判为违反，但语义上它是"无信息"而非"错值"。故规格补上该豁免——这是**规格的缺陷**（原命题过强），不是实现的缺陷。∎
 
 **I4**：由 I7，`write_ok` 之后宿主的真实值恒为 `b`；回读要么在 `≤1+R₀` 次内读到 `b`（置 `E=b`），要么耗尽预算后执行最后一次 `applyState`（把宿主的当前真值写入 `E`，而不是保留乐观值）。两条出口都以 `E = 宿主值` 结束。∎
 
@@ -89,6 +90,8 @@ defaults  <  engineRow  <  probeRow  <  store
 **I9**：`normalizeConfig` 先展开 `DOCTOR_DEFAULTS`，再展开行 `config`（后者覆盖前者）；构造函数随后执行 `if (typeof stored === "boolean") this.config.enabled = stored`，即 `store` 是最后一个覆盖者。覆盖关系是函数复合，复合的最后一个定义域内的赋值必胜出 ⇒ 有效值 = `store`。∎
 
 **I10**：`doctorConfig()` 逐层 `layer()` 只复制 `DOCTOR_OWNED_KEYS` 里的键；`"enabled"` 在该数组内（`lib/engine.js`）。`layer(this.config)` 读引擎行，`layer(service?.config)` 读 probe 行的 `this.config`（即带 `store` 覆盖的那个对象）⇒ 开关值进入引擎合并结果。∎
+
+**I11**：由 `mergeDefined()` 的实现直接给出：其循环体显式跳过 `undefined` 与 `null`。原先 `probe.js` 的两处展开（`normalizeConfig`、`_policy`）不满足该性质——`_policy()` 在引擎行省略某个键（例如只在 probe 行声明的 `summaryBudgetRatio`）时会把该键覆盖成 `undefined`，随后 `_numbers()` 读到 `undefined`。这是**实现违背定理**、而非定理有误，故修实现而非改定理。∎
 
 ---
 
@@ -127,3 +130,45 @@ defaults  <  engineRow  <  probeRow  <  store
 3. `profileDir()` 依赖环境变量；检验器在临时 `$DSH_HOME` 下运行真实函数，但不断言真实 profile 的权限语义。
 4. `renameSync` 的原子性以同一文件系统为前提（`profileDir()` 内），跨设备 `rename` 未建模。
 5. 深度 `D` 是有限的（`D=8`）；`D` 之外的串未被穷尽。这是本规格的最强边界条件。
+
+---
+
+## 8. 机器检验结果（`test/model/check.mjs`）
+
+在 v0.4.1 + I11 修复的代码上运行（Lead 独立复跑确认，非队友自报）：
+
+```
+可达状态 618 / 转移边 4811 / 截断边 2565 / 重放事件串 31237 / 深度上界 8
+合计 15 条：PASS 15，FAIL 0，SKIP 0      exit 0
+
+同一检验器 --depth=24：可达状态 1969 / 截断边 988 / 15 条仍全 PASS / exit 0
+（--depth=40 因重放缓存 OOM，属检验器自身资源上限）
+```
+
+**Chrome 边界**：`D=8` **未饱和**——2565 条被截断的边里 1107 条通往新的抽象状态，所以「深度 8 内穷尽」成立，但更深仍会产生新状态。上表给出的 `D=24` 是负向证据：多探索 3 倍深度后不变量仍无违反。真正的完备性需要状态图封闭（无截断边），当前未达到。
+
+| 检验 | 判定 | 关键计数 |
+|---|---|---|
+| I1 无死开关 | PASS | 可点状态 145 个，实点 145 次全部发出 PUT；`disabled ≡ (P ∨ F)` 在 405 个挂载态成立；首帧可点且点击发 PUT |
+| I2 忙有界 | PASS | 211 个 `P=1` 状态；最坏解除 11000ms（上界紧）；探索 26287 个时间-事件结点 |
+| I3 显示一致性 | PASS（补豁免后） | 405 个挂载态错值 0；写途豁免 88、无值豁免 87 |
+| I4 收敛 | PASS | 静默态 42 个全部不说谎；对手永远不同意时 2 轮后 `E=宿主最后报告值` |
+| I5 读有界 | PASS | 单 epoch 最大回读 1（上界 3）；首次一致即收工；写失败路径恰好 1 次回读 |
+| I6 计时器卫生 | PASS | 静默态 52 个、卸载态 213 个，计时器均 0 |
+| I7 宿主后置条件 | PASS | `b=⊤`/`b=⊥` 各 snapshot×3 + 重载 + 磁盘一致 |
+| I8 存储忠实性 | PASS | 垃圾文档 14 组 ⇒ 全部 `undefined`；`mkdir`/`write` 注入：`ok=true, persisted=false`，内存生效、无残留 tmp |
+| I9 优先级定理 | PASS | 48 组穷尽：file 为布尔时 store 必胜 32 组；file 缺失时 probe 行生效 16 组；引擎行携带 `enabled` 被 schema 拒绝 48 组 |
+| I10 引擎可见性 | PASS | probe 行两态 + 同进程翻转，4 次读取全部跟随（无需重启） |
+| I11a 格并代数律 | PASS | 二元 64 组 + 三元 512 组 + 幂等/单位元 12 组 |
+| I11b/c/d 三处真实合并点 | PASS | 下层存活 34 + 36 + 28 组；有意见逐键一致 84 组 |
+| I11e 全仓展开式合并审计 | PASS | **性质型**：运行期从当前源码现取 23 个站点（零写死行号）；来源 ≥2 的展开**运行期断言键集不相交**，解析不出操作数则 SKIP。结果 22 PASS / 1 SKIP / 0 FAIL |
+
+**检验器带来的两处修正**（都不是"多试几个用例"能得到的）：
+
+1. **规格缺陷**：I3 原命题过强——"读从未成功 ⇒ 显示无值"按字面算违反，最短轨迹
+   `mount_ok_on → click → write_ok → tick_3000`。已补豁免。
+2. **实现缺陷**：`lib/probe.js:1445` 的 `editor.edit` 回调用展开合并，`patch` 里显式 `undefined` 会把行里已有键抹掉
+   （`writeConfigPatch({patch:{summaryBudgetRatio: undefined}})` 可达）。HTTP/JSON 表达不了 `undefined`，
+   故只有进程内调用者可达，但它违背 I11，已改用 `mergeDefined()`。
+
+**未注入的项**：只读目录故障（本机 Windows ACL 不因 `chmod` 拒绝写入）——按规格第 7 节标注为平台限制，非遗漏。

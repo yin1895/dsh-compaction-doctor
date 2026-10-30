@@ -1483,6 +1483,47 @@ test("status: the switch is persisted by the plugin, never through the profile p
   }
 });
 
+test("probe: every config merge is a lattice join, never a spread", () => {
+  // I11 in docs/formal.md. A spread lets an absent key erase a lower layer's
+  // value — `{...{k:1}, ...{k:undefined}}` is `{k: undefined}` — so the join
+  // property is checked over the whole value domain that matters here instead of
+  // on a couple of examples.
+  const values = [undefined, null, 1, 0, "x", "", false, true];
+  // The join's exact statement: `undefined` and `null` BOTH mean "no opinion" in
+  // every layer (matching `layer()` in engine.js), so the result is the LAST
+  // source that holds an opinion, and absent when none does.
+  const holdsOpinion = (value) => value !== undefined && value !== null;
+  for (const lower of values) {
+    for (const upper of values) {
+      const joined = probeMod.mergeDefined({ k: lower }, { k: upper });
+      const opinions = [lower, upper].filter(holdsOpinion);
+      const expected = opinions.length === 0 ? undefined : opinions[opinions.length - 1];
+      assert.equal(joined.k, expected, `join(${String(lower)}, ${String(upper)})`);
+      if (expected === undefined) {
+        assert.ok(!Object.prototype.hasOwnProperty.call(joined, "k"), "no opinion leaves no key behind");
+      }
+    }
+  }
+
+  // The concrete shape that used to break: the engine row omits a key that only
+  // the probe row declares.
+  const merged = probeMod.mergeDefined({ summaryBudgetRatio: 0.9, enabled: true }, { enabled: false, thresholdRatio: 0.75 });
+  assert.equal(merged.summaryBudgetRatio, 0.9, "an omitted engine-row key must not erase the probe row's value");
+  assert.equal(merged.enabled, false, "but a declared value still wins");
+
+  // The same property at both real merge points.
+  const doctor = new probeMod.CompactionDoctor(
+    makeCtx({ compaction: { config: { headroomTokens: 65536, summaryBudgetRatio: undefined } } }),
+    { fallbackContextWindow: 512000, summaryBudgetRatio: 0.77 },
+  );
+  assert.equal(doctor._policy().summaryBudgetRatio, 0.77, "_policy() keeps what the engine row omits");
+  assert.equal(doctor._policy().headroomTokens, 65536, "and lets the engine row override what it declares");
+
+  const normalized = probeMod.normalizeConfig({ enabled: true, provider: undefined, maxSummaryChunks: null });
+  assert.equal(normalized.enabled, true);
+  assert.equal(normalized.maxSummaryChunks, 8, "null is 'no opinion', not a value");
+});
+
 // ---------------------------------------------------------------------------
 // run
 // ---------------------------------------------------------------------------

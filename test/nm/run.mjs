@@ -1089,6 +1089,77 @@ test("status: renderScalar quotes only what YAML needs", () => {
   assert.equal(statusMod.renderScalar("a: b"), '"a: b"');
 });
 
+test("status: the route installs on webServer and serves a real state request", async () => {
+  // The transport is the only thing between the settings page and the host, and
+  // nothing else in this suite drives it end to end.
+  const registered = [];
+  const webServer = { register(route) { registered.push(route); return () => {}; } };
+  const session = makeSession(conversationEvents());
+  const meter = makeMeter(() => measurementOf(pricedNodes(20, 500), 10000));
+  const ctx = makeCtx({ llm: fakeLlm, sessions: { active: () => session }, tokenMeter: meter, webServer });
+  const doctor = new probeMod.CompactionDoctor(ctx, {
+    enabled: true,
+    probeOnStart: false,
+    writeConfig: false,
+    scaleMode: "meter",
+    baseURL: "http://127.0.0.1:1/v1",
+  });
+  assert.equal(doctor._routeRegistered, true, "the doctor reports a live route");
+  assert.equal(registered.length, 1);
+  assert.equal(registered[0].kind, "prefix");
+  assert.equal(registered[0].path, "/dsh-compaction-doctor");
+
+  const makeRes = () => ({
+    statusCode: 0,
+    headers: {},
+    body: "",
+    setHeader(name, value) {
+      this.headers[name] = value;
+    },
+    end(text) {
+      this.body = text;
+    },
+  });
+
+  const ok = makeRes();
+  await registered[0].handler(
+    { method: "GET", url: "/dsh-compaction-doctor/state", headers: { "x-compaction-doctor": "1", host: "127.0.0.1:18532" } },
+    ok,
+  );
+  assert.equal(ok.statusCode, 200, ok.body);
+  assert.match(String(ok.headers["content-type"]), /application\/json/u);
+  assert.equal(ok.headers["cache-control"], "no-store");
+  const payload = JSON.parse(ok.body);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.host.route, "/dsh-compaction-doctor");
+  assert.equal(payload.session.route.provider, "huaiyuan");
+  assert.ok(payload.measurement.nodes > 0, "the status card gets real pricing");
+  // No compaction service is mounted in this fixture, and the card must say so
+  // instead of inventing a scale mode.
+  assert.equal(payload.engine.present, false);
+  assert.equal(payload.engine.scaleMode, "unknown");
+  assert.equal(payload.engine.meterPatched, false);
+
+  const forbidden = makeRes();
+  await registered[0].handler({ method: "GET", url: "/dsh-compaction-doctor/state", headers: {} }, forbidden);
+  assert.equal(forbidden.statusCode, 403);
+  assert.equal(JSON.parse(forbidden.body).ok, false);
+
+  const unknown = makeRes();
+  await registered[0].handler(
+    { method: "GET", url: "/dsh-compaction-doctor/nope", headers: { "x-compaction-doctor": "1" } },
+    unknown,
+  );
+  assert.equal(unknown.statusCode, 404, "an unknown endpoint is not silently served");
+
+  const wrongType = makeRes();
+  await registered[0].handler(
+    { method: "POST", url: "/dsh-compaction-doctor/diagnose", headers: { "x-compaction-doctor": "1", "content-type": "text/plain" } },
+    wrongType,
+  );
+  assert.equal(wrongType.statusCode, 415, "writes demand a JSON content type");
+});
+
 // ---------------------------------------------------------------------------
 // bundle surface
 // ---------------------------------------------------------------------------

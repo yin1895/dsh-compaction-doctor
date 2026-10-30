@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-compaction-doctor",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "DSH 上下文压缩诊断与修复插件：探测路由真实可用窗口、在设置页里用几个按钮完成「诊断 → 修复 → 状态监控 → 回滚」，并从装配缝上修好压缩（真实尺度保留定价、分块摘要、非英文溢出报错识别）。",

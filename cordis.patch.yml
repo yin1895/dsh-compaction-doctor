@@ -16,6 +16,18 @@
   disabled: true
 
 - insert:
+    # ── the browser half's discovery row ─────────────────────────────────────
+    # `dsh-client-modules` resolves a Loader row to its package through
+    # `exactPackageSpecifier()` (`dsh-client-modules/lib/index.js:83-89`), which
+    # returns undefined for a SUBPATH specifier. A package that declares
+    # `dsh.client` but is mounted only via `<name>/probe` / `<name>/engine` is
+    # therefore never registered as a browser module: `/plugins/<name>/client.js`
+    # 404s and none of its settings UI appears. This row gives the package its
+    # bare-name entry; `lib/index.js` is a deliberate no-op host half. Every
+    # client-half plugin on this machine does the same.
+    - id: compaction-doctor-client
+      name: '@local/dsh-compaction-doctor'
+
     # Upstream capability probe + settings-page transport + diagnostic report.
     #
     # This row's Config is marked `.volatile()`, which is what makes it a

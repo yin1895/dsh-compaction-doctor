@@ -1225,6 +1225,28 @@ test("bundle: index.js exposes every documented entry point", () => {
   assert.equal(util.latestRoute(makeSession([]), { provider: "huaiyuan" }), undefined);
 });
 
+test("bundle: the patch keeps a bare-name row so the browser half is discovered", () => {
+  // `dsh-client-modules/lib/index.js:83-89` resolves a Loader row to its package
+  // through `exactPackageSpecifier()`, which returns `undefined` for a SUBPATH
+  // specifier. A package mounted only through `<name>/probe` is therefore never
+  // registered as a browser module: `/plugins/<name>/client.js` 404s and the
+  // settings page silently never appears. This is the regression that made the
+  // first release look like it had no UI at all.
+  const text = fs.readFileSync(path.resolve(here, "..", "..", "cordis.patch.yml"), "utf8");
+  const names = [...text.matchAll(/^\s*name:\s*'([^']+)'/gmu)].map((match) => match[1]);
+  assert.ok(names.includes("@local/dsh-compaction-doctor"), `no bare-name row: ${names.join(", ")}`);
+  assert.ok(names.includes("@local/dsh-compaction-doctor/probe"), "the probe row is still declared");
+  assert.ok(names.includes("@local/dsh-compaction-doctor/engine"), "the engine row is still declared");
+  assert.ok(text.includes("compaction-basic"), "the shipped backend is still overridden");
+  // The bare-name row mounts `lib/index.js`, which must therefore be a harmless
+  // no-op plugin: a `default` export would mount a SECOND probe service.
+  assert.equal(surfaceMod.default, undefined, "index.js must not export a plugin as default");
+  assert.equal(typeof surfaceMod.apply, "function", "index.js is mountable as a no-op host half");
+  const pkg = JSON.parse(fs.readFileSync(path.resolve(here, "..", "..", "package.json"), "utf8"));
+  assert.equal(pkg.dsh?.client?.platform, "web", "the browser half is declared");
+  assert.equal(pkg.exports?.["./client"], "./lib/client.js", "the ./client export points at the bundle");
+});
+
 // ---------------------------------------------------------------------------
 // run
 // ---------------------------------------------------------------------------

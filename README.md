@@ -39,11 +39,11 @@ DSH 的自动压缩 / 手动 `/compact` 在这套部署上曾经完全不工作�
 ```
 D:\dsh-compaction-doctor\
 ├── package.json              # dsh.bundle.patch + dsh.client.platform=web + exports["./client"]
-├── cordis.patch.yml          # 停用 compaction-basic，插入 probe / engine 两行
+├── cordis.patch.yml          # 停用 compaction-basic，插入 discovery / probe / engine 三行
 ├── icon.svg                  # 设置页插件图标（插件管理页展示）
 ├── locale\{zh,en}.json       # 栏目文案（键集必须一一对应，否则 locale 注册会抛错）
 ├── lib\
-│   ├── index.js              # 聚合导出
+│   ├── index.js              # 裸包名那一行的宿主半侧（**故意的空实现**，见下）
 │   ├── probe.js              # 宿主：诊断/修复/状态能力 + /compact-doctor 命令 + 行 Config(volatile)
 │   ├── engine.js             # 宿主：CompactionEngine 替代实现
 │   ├── status.js             # 宿主：设置页 HTTP 通道（三道闸 + 端点分发 + YAML 行配置改写）
@@ -53,12 +53,45 @@ D:\dsh-compaction-doctor\
 │   ├── util.js               # 宿主：工具
 │   └── client.js             # 浏览器半侧：设置页栏目（五张卡，无构建工具）
 └── test\
-    ├── nm\run.mjs            # 宿主：48 条离线测试（真实签名 + 桩模块）
+    ├── nm\run.mjs            # 宿主：51 条离线测试（真实签名 + 桩模块）
     └── client\run.mjs        # 浏览器半侧：30 条契约 + 渲染冒烟测试
 ```
 
-宿主侧挂两行，客户端半侧**不需要任何行**（`dsh.client.platform: "web"` 就是声明，
-模块系统据此把 `lib/client.js` 作为 `/plugins/@local/dsh-compaction-doctor/client.js` 提供出去）。
+### 2.1 ⚠️ 为什么必须有一行 `name` 是**裸包名**
+
+这是 v0.2.1 修的第二个「看起来没生效」问题，也是整个设置页能不能出现的前提：
+
+`dsh-client-modules` 把一个 Loader 行映射到它的包，用的是
+`exactPackageSpecifier()`（`dsh-client-modules\lib\index.js:83-89`）——**带子路径的 specifier 直接返回 `undefined`**：
+
+```js
+function exactPackageSpecifier(specifier) {
+  if (specifier.startsWith("@")) {
+    const parts = specifier.split("/");
+    return parts.length === 2 && parts.every(Boolean) ? specifier : void 0;   // ← 子路径 = undefined
+  }
+  return specifier.length > 0 && !specifier.includes("/") && !specifier.includes(":") ? specifier : void 0;
+}
+```
+
+于是 `@local/dsh-compaction-doctor/probe` 这类行**永远不会**让这个包被注册成浏览器模块：
+`/plugins/<包名>/client.js` 返回 404，设置面板里那一栏根本不出现——宿主侧却一切正常，所以特别容易误判成"没装好"。
+
+本机四个带浏览器半侧的插件全都是裸包名，正好互为佐证：
+
+| 插件 | patch 里的行 name | 浏览器半侧 |
+|---|---|---|
+| dsh-pet | `dsh-pet` | ✅ |
+| `@opencode2dsh/dsh-plugin` | `@opencode2dsh/dsh-plugin` | ✅ |
+| dsh-workbuddy-connect | `dsh-workbuddy-connect` | ✅ |
+| dsh-purge | `dsh-purge`（另有 `dsh-purge/redteam` 等子路径行） | ✅ |
+| **本插件（v0.2.0 及以前）** | 只有 `.../probe`、`.../engine` | ❌ **不出现** |
+| **本插件（v0.2.1 起）** | 额外一行 `name: '@local/dsh-compaction-doctor'` | ✅ |
+
+因此 `cordis.patch.yml` 里有第三行 `id: compaction-doctor-client` / `name: '@local/dsh-compaction-doctor'`，
+它挂的就是 `lib\index.js`——那个文件**故意不导出 `default`**，只导出 `apply()` 空实现，
+免得这个裸包名行把 `compactionDoctor` 服务二次实例化。测试 `bundle: the patch keeps a bare-name row …`
+就是钉这条规则的。
 
 ---
 
@@ -86,6 +119,16 @@ D:\dsh-compaction-doctor\
 一次写入会在你正在用的会话里生效，而不是等你重启。
 
 ### 首次验证
+
+**先确认浏览器半侧真的被服务了**（这一步能区分"没装好"和"版本太旧"——v0.2.0 缺裸包名行时，这里会 404）：
+
+```powershell
+# 端口看 DSH 正在用的那个
+curl.exe -s -o NUL -w "%{http_code}`n" "http://127.0.0.1:52616/plugins/@local/dsh-compaction-doctor/client.js?rev=0"
+```
+
+- `404` ⇒ 客户端半侧没进组合图：确认安装的是 **v0.2.1 或更新**（`node_modules\@local\dsh-compaction-doctor\package.json` 的 `version`），且 `cordis.patch.yml` 里有 `id: compaction-doctor-client` 那一行，然后重启。
+- `200`（或无论如何不是 404）⇒ 再往下看：
 
 1. 设置页左侧应出现新栏目「**上下文压缩**」（排在官方五项之后，图标是齿轮——`settings.section` 契约没有图标位，`navIcon` 对未知 id 兜底成齿轮）。
 2. 点「一键诊断」，应看到真实窗口、输出上限、以及与配置是否矛盾的结论。
@@ -235,7 +278,7 @@ npm run test:all
 ## 9. 回滚
 
 1. 从 `dsh.profile.bundles` 移除 `@local/dsh-compaction-doctor`，删掉 profile `package.json` 里的依赖，`pnpm install`。
-2. 删掉 profile `cordis.patch.yml` 里本插件的两行 `insert` 与 `compaction-basic` 的 `disabled: true` 覆盖行（**必须一起删**，否则两个 `ctx.compaction` 注册者谁赢不确定）。
+2. 删掉 profile `cordis.patch.yml` 里本插件的**三行** `insert` 与 `compaction-basic` 的 `disabled: true` 覆盖行（**必须一起删**，否则两个 `ctx.compaction` 注册者谁赢不确定）。
 3. 或用备份整体还原：`cordis.patch.yml.bak-compaction-doctor-*`（设置页「备份」卡可一键还原）。
 4. 重启 DSH。
 

@@ -18,6 +18,9 @@
     "./plan": "./lib/plan.js",
     "./package.json": "./package.json"
   },
+  "scripts": {
+    "test": "node test/nm/run.mjs"
+  },
   "files": [
     "lib",
     "cordis.patch.yml",

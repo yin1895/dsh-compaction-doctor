@@ -3,7 +3,8 @@
 给 DSH（DeepSeek Harness）用的**上下文压缩诊断与修复**插件。
 
 v0.2 起它有一个**设置页栏目**：在 DSH「设置 → 上下文压缩」里，用几个按钮就能
-诊断真实可用窗口、把正确的能力值写回配置、调压缩引擎参数、看运行状态、必要时回滚。
+诊断真实可用窗口、按你用到的模型自动把正确的能力值写回配置，并在装配缝上修好压缩本身。
+设置页只有一个开关，其余全程无感。
 
 宿主侧仍然是那个压缩后端（真实尺度保留定价 + 分块摘要 + 非英文溢出报错识别），
 但**所有会改配置的动作都变成显式点击**——不再有"启动就偷偷写配置"。
@@ -24,13 +25,13 @@ DSH 的自动压缩 / 手动 `/compact` 在这套部署上曾经完全不工作�
 | D3 | `contextWindow` 配成 512,000 时手动 `/compact` 必然失败 | 摘要输入本身超窗口 | 分块层次摘要（`lib/engine.js: summarize`） |
 | D4 | 上游中文 400（`内容太长了，请精简输入或开启新对话`）没有被识别为上下文超限 | 没有溢出恢复，回合直接失败 | `lib/overflow.js` 分类 + `agent/request-error` 恢复一次 |
 | D5 | `maxTokens: 384000` 吃掉 37% 的窗口 | 消息预算被压缩 | 设置页把输出上限夹到 65,536 |
-| D6 | v0.1 **把单会话观测到的 `maxAcceptedPrompt` 当成模型能力永久写进 profile** | 配置被静默改写，停用也不回滚 | v0.2 起 `writeConfig` 默认 `false`，只有点「一键修复」才写，且先备份 |
+| D6 | v0.1 **把单会话观测到的 `maxAcceptedPrompt` 当成模型能力永久写进 profile** | 配置被静默改写，停用也不回滚 | v0.2 起默认不写；v0.4 起写只发生在「开关已开 + 用户真的用到了那个模型 + 配置与上游事实矛盾」时，写前逐字节备份 |
 
 > **⚠️ v0.1 留下的现场**：如果你装过 v0.1，profile 里 `DeepSeek-V4.1-Flash` 的
 > `contextWindow` 可能已被改成观测值（本机实测为 `950127`，原值 `512000`），
 > `maxTokens` 从 `384000` 改成了 `65536`。原文件备份在
-> `<profile>/cordis.patch.yml.bak-compaction-doctor-<epoch>`，设置页「备份」卡里可以直接还原，
-> 也可以让「一键修复」重新写一次。
+> `<profile>/cordis.patch.yml.bak-compaction-doctor-<epoch>`，把它复制回 `cordis.patch.yml` 再重启即可还原；
+> 或者直接把开关打开，等你真的用到这个模型时它会自己改成上游真实能力值（并再备份一次）。
 
 ---
 
@@ -51,7 +52,7 @@ D:\dsh-compaction-doctor\
 │   ├── overflow.js           # 宿主：溢出分类
 │   ├── plan.js               # 宿主：预算/选择算法
 │   ├── util.js               # 宿主：工具
-│   └── client.js             # 浏览器半侧：设置页栏目（五张卡，无构建工具）
+│   └── client.js             # 浏览器半侧：设置页栏目（一个开关 + 状态行，无构建工具）
 └── test\
     ├── nm\run.mjs            # 宿主：51 条离线测试（真实签名 + 桩模块）
     └── client\run.mjs        # 浏览器半侧：30 条契约 + 渲染冒烟测试
@@ -131,29 +132,63 @@ curl.exe -s -o NUL -w "%{http_code}`n" "http://127.0.0.1:52616/plugins/@local/ds
 - `200`（或无论如何不是 404）⇒ 再往下看：
 
 1. 设置页左侧应出现新栏目「**上下文压缩**」（排在官方五项之后，图标是齿轮——`settings.section` 契约没有图标位，`navIcon` 对未知 id 兜底成齿轮）。
-2. 点「一键诊断」，应看到真实窗口、输出上限、以及与配置是否矛盾的结论。
-3. 打开任意会话，命令面板里应有 `/compact-doctor`。
-4. 日志应出现 `[compaction-doctor] loaded (...)` 与 `settings page transport registered at /dsh-compaction-doctor`。
+2. 打开它，把那个**开关**打到开。状态行会从「未开启…」变成「已开启。开始对话后会按你用的模型自动检查。」。
+3. 回聊天窗随便发一条消息（让某个模型真的被用到），再回到设置页——状态行会变成「已自动修正 … 的长度设置（改前已备份）」或「… 的设置是正确的」。
+4. 打开任意会话，命令面板里应有 `/compact-doctor`（手动诊断的逃生口，平时用不到）。
+5. DSH 日志里应出现 `[compaction-doctor] loaded (...)`、`settings page transport registered at /dsh-compaction-doctor`，以及需要修正时的 `automatic repair for <provider>/<model>: ... (backup ...)`。
 
 ---
 
-## 4. 设置页栏目：五张卡
+## 4. 设置页栏目：只有一个开关
 
-| 卡 | 做了什么 | 走哪条通道 |
-|---|---|---|
-| **诊断** | 读持久会话里"上游真正接受过的 prompt"、适配器目录、网关 `/models`，给出真实窗口 + 输出上限 + 是否与配置矛盾 + 建议值 | `POST /diagnose` |
-| **修复** | 先给变更预览（`512000 → 1048576`），再点「应用」才写；写入前自动备份，写完提示备份文件名与「已热重载」，并自动重跑一次诊断证明闭环 | `POST /apply`（必须 `confirm:true`） |
-| **引擎参数** | 12 个字段：自动压缩 / 启动探测 / 允许写回 / 缩放模式 / 分块数 / 估算系数 / 摘要预算比 / 遮蔽上限比 / 溢出恢复 / 输出夹取 / 阈值比 / 保留比 | 优先官方设置命名空间 `ctx.configForms.get('compaction-doctor')`；不可用时降级 `GET/PUT /config` |
-| **状态** | 压力 / 阈值 / 缩放系数 k / 节点数 / 最近一次压缩（触发方式、遮蔽节点数与 token）/ 守卫失败次数；压力超阈值时圆点变黄 | `GET /state`，页面挂载期每 2s 一次，切走即停 |
-| **备份** | 列出 profile 下所有 `cordis.patch.yml.bak*`（时间 / 文件名 / 大小），可一键还原（还原前宿主会再备份现场文件） | `GET /backups` · `POST /restore` |
+页面刻意做到极小，全部内容就是这三行：
 
-设计约束（都已在实现里落地）：
+```
+上下文压缩
 
-- 页面**不会白屏**：`configForms` 是软依赖（`ctx.get('configForms')` + undefined 判断），
-  任一请求失败只渲染一行本地化红字。
-- 栏目是「切走即卸载」的，所以轮询计时器由组件 `useEffect` 拥有，卸载即清。
-- 视觉全走 `--dsw-alias-*` 语义 token，根容器 `max-width:720px`，与官方设置页一致。
+打开后，DSH 会按你用到的模型自动校正上下文长度设置，不需要你操作。
+
+[ ●———]  已开启。已自动修正 DeepSeek-V4.1-Flash 的长度设置（改前已备份）。
+```
+
+- **一句介绍**：说明这个开关会做什么。
+- **一个开关**：整个页面唯一的控件，绑 `enabled`。关 = 插件完全不工作（不探测、不写配置、压缩行为与官方一致）；开 = 自动模式。
+- **一行状态**：宿主给的 `auto.key` 在浏览器侧本地化，可能的取值就是下表的 8 种；**界面上一个数字、一个字段名、一个术语都没有**。
+
+| `auto.key` | 状态行 |
+|---|---|
+| `auto.off` | 未开启。DSH 使用它自己的默认设置。 |
+| `auto.none` | 已开启。开始对话后会按你用的模型自动检查。 |
+| `auto.pending` | 已开启。正在准备检查你当前用的模型… |
+| `auto.running` | 已开启。正在检查 {model}… |
+| `auto.ok` | 已开启。{model} 的设置是正确的。 |
+| `auto.found` | 已开启。发现 {model} 的长度设置需要修正… |
+| `auto.fixed` | 已开启。已自动修正 {model} 的长度设置（改前已备份）。 |
+| `auto.failed` | 已开启，但自动检查失败了。详情见 DSH 日志。 |
+
+页面只碰两个端点：`GET /state`（读开关与状态）/ `PUT /config`（写开关，body 只有 `{"enabled":true|false}`）。
+挂载时只读一次，**没有轮询、没有常驻计时器**；失败不白屏，开关回落到真实值。
+
+### 4.1 自动化到底做了什么（「全程无感」的规则）
+
+这是 v0.4 的核心，规则只有三条：
+
+1. **懒**：不在启动时做任何事。`enabled` 为真时，第一次真的要用某个模型（`agent/pre-step`）才去查它，一个进程内每个 `(provider, model)` 只查一次。
+2. **只碰正在用的那一个**：只看当前会话正在使用的模型与它的提供商。其余已配置的提供商与模型**永远不会**被读、被定价、被改写——`discoverViaAdapter()` 只查 `route.provider` / `route.model`，`rewriteModelWindow()` 只改那一个模型行。
+3. **自动修正，先备份**：只有当「配置里的长度」与「上游真正接受过的 prompt」矛盾时才写，写前对 `cordis.patch.yml` 做逐字节备份，写完把 `contextWindow`/`maxTokens` 记进 `this.written`（否则紧接着的复查会读到旧值而误报失败），并写一行 DSH 日志。
+
+开关写的是 **probe 行的 `enabled`**，而引擎通过 `DOCTOR_OWNED_KEYS` 把 `enabled` 一并纳入配置分层，
+所以开关确实能同时管到「探测」和「压缩引擎」——回归测试 `engine: the single switch (probe row) actually reaches the engine` 钉死了这条。
+
+`autoRepair`（默认 `true`，不在页面上）是自动修正的总闸：置 `false` 就只查不写。
+`writeConfig` 只管 `/compact-doctor` 这条命令路径，与自动模式无关。
+
+### 4.2 视觉与生命周期约束
+
+- 页面**不会白屏**：GET 失败 → 开关禁用 + 状态行灰字；PUT 失败 → 开关回到真实值。
+- 不硬编码背景/文字色（深浅主题都不会糊）；开关用官方语义 token。
 - 样式表用 `style[data-plugin-css]` 去重 + `data-plugin="<包名>"` 标记，插件卸载时被模块系统回收。
+- 本地化：状态行文案全在 `locale/{zh,en}.json`，宿主只给 `key + params`，所以英文界面下不会冒出中文句子。
 
 ---
 
@@ -163,15 +198,16 @@ curl.exe -s -o NUL -w "%{http_code}`n" "http://127.0.0.1:52616/plugins/@local/ds
 
 | 行 id | 模块 | 配置属于谁 |
 |---|---|---|
-| `compaction-doctor` | `.../probe` | **诊断类**字段 + 页面可编辑的 `thresholdRatio` / `retainRatio`，全部在 `Config` 里标了 `.volatile()` ⇒ 这就是那个设置命名空间，页面可直接读写 |
+| `compaction-doctor-client` | `.../index.js` | 空实现。**只为了让浏览器半侧被发现**（见 §2.1），没有任何配置 |
+| `compaction-doctor` | `.../probe` | **开关 + 诊断类**字段。`enabled`（页面那个开关）/ `autoRepair` / `thresholdRatio` / `retainRatio` 都在 `Config` 里标了 `.volatile()`；除开关外都只能靠改 profile patch 调 |
 | `compaction-doctor-engine` | `.../engine` | **压缩策略**字段（`auto` / `thresholdRatio` / `headroomTokens` / `retainRatio` / `maxTokens` / `compactionRetries` / `maxOverflowRetries`）。它们被随包基类 `deepFreeze` 进 `this.config`，所以改它只能重写该行 `config` 并靠热重载生效 |
 
 **阈值比 / 保留比的优先级**（这是唯一一个两行都有的键，必须说清）：
 
-1. 页面（probe 行）的值与引擎行的值**相同**（全新安装就是这样）⇒ 随包路径原样运行，行为零变化。
-2. 两者**不同** ⇒ 引擎切到自己的选择路径，用页面的数字重新定价与选头（因为 `this.config` 冻结了，改不动它）。
+1. probe 行的值与引擎行的值**相同**（全新安装就是这样）⇒ 随包路径原样运行，行为零变化。
+2. 两者**不同** ⇒ 引擎切到自己的选择路径，用 probe 行的数字重新定价与选头（因为 `this.config` 冻结了，改不动它）。
 3. 引擎行仍然负责 `auto` / `headroomTokens` / `maxTokens` / `compactionRetries` / `maxOverflowRetries`——
-   这些没有页面入口，改动要么用 `PUT /config`，要么直接编辑 profile patch。
+   这些没有页面入口，改动只能直接编辑 profile patch。
 
 诊断类字段的优先级：`DOCTOR_DEFAULTS` < 引擎行 `config` < probe 行 `config`（probe 行话事）。
 
@@ -179,9 +215,10 @@ curl.exe -s -o NUL -w "%{http_code}`n" "http://127.0.0.1:52616/plugins/@local/ds
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `enabled` | `true` | 关闭后引擎的 `compactIfNeeded` 直接返回 `null`（完全惰性） |
-| `probeOnStart` | `true` | 启动 1.5s 后跑一次**只读**探测（不写配置） |
-| `writeConfig` | **`false`** | 置 `true` 后 `/compact-doctor` 命令也会写回；默认只有设置页的「一键修复」会写 |
+| `enabled` | **`false`** | **设置页那个唯一的开关**。关 = 完全惰性（不探测、不写、`compactIfNeeded` 直接返回 `null`）；开 = 自动模式 |
+| `autoRepair` | `true` | 自动模式的总闸。置 `false` 则只查不写（不开页面的排查档位） |
+| `probeOnStart` | 忽略 | v0.4 起不再有启动期扫描（写了也无效），保留只为兼容旧 profile patch |
+| `writeConfig` | **`false`** | 只管 `/compact-doctor` 命令路径；自动模式由 `enabled` + `autoRepair` 决定，与它无关 |
 | `overflowRecovery` | `true` | 关掉后不再把中文 400 当上下文超限 |
 | `scaleMode` | `meter` | `meter`（默认，走随包路径但把节点重定价）/ `select`（本地选头 + 配对裁剪）/ `off`（完全停用修复，用于 A/B） |
 | `capMaxTokens` | `65536` | 输出上限的夹取上限 |
@@ -205,13 +242,13 @@ curl.exe -s -o NUL -w "%{http_code}`n" "http://127.0.0.1:52616/plugins/@local/ds
 
 页面不是靠"猜"读宿主的，中间有一条**冻结的契约**（实现见 `lib/status.js`）：
 
-| 端点 | 作用 |
-|---|---|
-| `GET /state` | 轮询快照（压力/阈值/缩放/最近压缩/守卫失败） |
-| `POST /diagnose` | 一键诊断（只读） |
-| `POST /apply` | 一键修复（`confirm:true`，先备份再写） |
-| `GET` / `PUT /config` | 引擎参数的降级通道（命名空间不可用时） |
-| `GET /backups` · `POST /restore` | 备份列表与还原（`confirm:true`） |
+| 端点 | 作用 | 谁在用 |
+|---|---|---|
+| `GET /state` | 快照：开关值 + 状态行所需的 `auto.key` + 诊断明细 | **设置页每次挂载读一次** |
+| `PUT /config` | 写开关（body 只有 `{"enabled":true\|false}`） | **设置页的开关** |
+| `POST /diagnose` | 手动诊断（只读） | `/compact-doctor` 命令、排查用 |
+| `POST /apply` | 手动写回（`confirm:true`，先备份再写） | 手动路径，自动模式不走它 |
+| `GET /backups` · `POST /restore` | 备份列表与还原（`confirm:true`） | 手动路径 |
 
 **鉴权**：`webServer` 本身零鉴权，`/api` 的信任栅栏也不覆盖自定义前缀路由，所以每个请求都要过三道闸：
 ① 必带自定义头 `x-compaction-doctor: 1`（跨站简单请求伪造不出来，会触发预检）；
@@ -279,7 +316,7 @@ npm run test:all
 
 1. 从 `dsh.profile.bundles` 移除 `@local/dsh-compaction-doctor`，删掉 profile `package.json` 里的依赖，`pnpm install`。
 2. 删掉 profile `cordis.patch.yml` 里本插件的**三行** `insert` 与 `compaction-basic` 的 `disabled: true` 覆盖行（**必须一起删**，否则两个 `ctx.compaction` 注册者谁赢不确定）。
-3. 或用备份整体还原：`cordis.patch.yml.bak-compaction-doctor-*`（设置页「备份」卡可一键还原）。
+3. 或用备份整体还原：`cordis.patch.yml.bak-compaction-doctor-*`（把最新那份复制回 `cordis.patch.yml` 再重启；自动修正每次都会生成一份）。
 4. 重启 DSH。
 
 ---

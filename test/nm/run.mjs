@@ -1139,6 +1139,11 @@ test("status: the route installs on webServer and serves a real state request", 
   assert.equal(payload.engine.present, false);
   assert.equal(payload.engine.scaleMode, "unknown");
   assert.equal(payload.engine.meterPatched, false);
+  // The settings page renders this and nothing else numeric-by-default.
+  assert.equal(typeof payload.plain, "object");
+  assert.equal(payload.plain.level, "unknown", "no diagnosis has run yet");
+  assert.equal(typeof payload.plain.text, "string");
+  assert.ok(Array.isArray(payload.plain.detail));
 
   const forbidden = makeRes();
   await registered[0].handler({ method: "GET", url: "/dsh-compaction-doctor/state", headers: {} }, forbidden);
@@ -1245,6 +1250,183 @@ test("bundle: the patch keeps a bare-name row so the browser half is discovered"
   const pkg = JSON.parse(fs.readFileSync(path.resolve(here, "..", "..", "package.json"), "utf8"));
   assert.equal(pkg.dsh?.client?.platform, "web", "the browser half is declared");
   assert.equal(pkg.exports?.["./client"], "./lib/client.js", "the ./client export points at the bundle");
+});
+
+test("status: the plain verdict is plain language, and leaks no internal vocabulary", () => {
+  // This is the ONLY text a user reads on the settings page: one sentence plus up
+  // to three detail lines. It must stay readable to someone who has never heard
+  // of scaling, shadowing, budgets or headroom.
+  const doctor = new probeMod.CompactionDoctor(makeCtx({}), { enabled: true, writeConfig: false });
+
+  const unknown = doctor._plainView(undefined);
+  assert.equal(unknown.level, "unknown");
+  assert.match(unknown.text, /点「检查」/u);
+
+  const ok = doctor._plainView({
+    configured: { contextWindow: 1048576, maxOutput: 65536 },
+    decision: { contextWindow: 1048576, maxOutput: 65536 },
+    route: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash" },
+  });
+  assert.equal(ok.level, "ok");
+  assert.match(ok.text, /没有发现问题/u);
+
+  const warn = doctor._plainView({
+    configured: { contextWindow: 950127, maxOutput: 384000 },
+    decision: { contextWindow: 1048576, maxOutput: 65536 },
+    route: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash" },
+  });
+  assert.equal(warn.level, "warn");
+  assert.match(warn.text, /950127/u, "the current value is quoted");
+  assert.match(warn.text, /1048576/u, "the suggested value is quoted");
+  assert.ok(warn.detail.length <= 3, `at most three detail lines, got ${warn.detail.length}`);
+  const shown = [warn.text, ...warn.detail].join(" ");
+  assert.ok(shown.includes("65536"), "the output-cap value is named somewhere");
+  assert.ok(
+    warn.detail.some((line) => line.includes("备份")),
+    "the user is told that fixing backs the file up first",
+  );
+
+  const banned =
+    /threshold|headroom|budget|shadow|scal|ratio|token|policy|namespace|volatile|configForms|revision|meter|select|maxAccepted|contextWindow|maxOutput|maxTokens/iu;
+  for (const view of [unknown, ok, warn]) {
+    assert.ok(!banned.test(view.text), `internal vocabulary in the verdict: ${view.text}`);
+    for (const line of view.detail) assert.ok(!banned.test(line), `internal vocabulary in a detail line: ${line}`);
+  }
+});
+
+test("probe: a verified write beats the stale session snapshot", () => {
+  // A session's recorded route only refreshes on its next request. The settings
+  // page re-checks immediately after 「修复」, so without this rule a successful
+  // fix would be reported as still-wrong.
+  const doctor = new probeMod.CompactionDoctor(makeCtx({}), {
+    enabled: true,
+    writeConfig: false,
+    fallbackContextWindow: 512000,
+    capMaxTokens: 65536,
+  });
+  const stale = { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 950127 };
+  assert.equal(doctor._configuredFor(stale).contextWindow, 950127);
+  assert.equal(doctor._configuredFor(stale).maxOutput, 65536);
+  assert.equal(doctor._configuredFor(undefined).contextWindow, 512000, "no session yet: the fallback stands");
+
+  doctor.written = { contextWindow: 1048576, maxOutput: 65536, at: new Date().toISOString() };
+  assert.equal(doctor._configuredFor(stale).contextWindow, 1048576, "the written value wins");
+  // And the verdict that reaches the page is therefore a clean bill of health.
+  const verdict = doctor._plainView({
+    configured: doctor._configuredFor(stale),
+    decision: { contextWindow: 1048576, maxOutput: 65536 },
+    route: stale,
+  });
+  assert.equal(verdict.level, "ok");
+});
+
+test("probe: the lazy pass only ever looks at the route in use, exactly once", async () => {
+  // The requirement in one test: handle the model + provider of the session the
+  // user is actually in, lazily, and never sweep the rest of the profile.
+  const doctor = new probeMod.CompactionDoctor(makeCtx({}), {
+    enabled: true,
+    fallbackContextWindow: 512000,
+    capMaxTokens: 65536,
+  });
+  const asked = [];
+  doctor.run = async (options) => {
+    asked.push(options.route);
+    return {
+      at: new Date().toISOString(),
+      route: options.route,
+      configured: { provider: options.route.provider, model: options.route.model, contextWindow: 950127, maxOutput: 384000 },
+      observed: {},
+      decision: { contextWindow: 1048576, maxOutput: 65536, winner: { source: "adapter" } },
+    };
+  };
+  const writes = [];
+  doctor._writeBack = async (args) => {
+    writes.push(args);
+    return { ok: true, backup: "cordis.patch.yml.bak-test" };
+  };
+
+  const routeA = { provider: "p1", model: "m1" };
+  const first = await doctor.ensureRoute(routeA);
+  assert.equal(first.status, "fixed");
+  assert.equal(asked.length, 1, "exactly one probe pass");
+  assert.equal(writes.length, 1, "exactly one write");
+  assert.deepEqual(writes[0].decision, { contextWindow: 1048576, maxOutput: 65536 });
+  assert.equal(doctor.written.contextWindow, 1048576, "the fix is authoritative for later passes");
+  assert.equal(doctor.autoState.get("p1\u0000m1").status, "fixed");
+
+  await doctor.ensureRoute(routeA);
+  assert.equal(asked.length, 1, "the same route is never looked at twice");
+
+  const routeB = { provider: "p1", model: "m2" };
+  await doctor.ensureRoute(routeB);
+  assert.equal(asked.length, 2, "a different model in use is looked at when it appears");
+  assert.equal(asked[1].model, "m2", "and only that one");
+  assert.equal(asked[1].provider, "p1");
+
+  // An already-correct route writes nothing.
+  doctor.run = async (options) => ({
+    at: new Date().toISOString(),
+    route: options.route,
+    configured: { provider: options.route.provider, model: options.route.model, contextWindow: 1048576, maxOutput: 65536 },
+    observed: {},
+    decision: { contextWindow: 1048576, maxOutput: 65536 },
+  });
+  const writesBefore = writes.length;
+  const clean = await doctor.ensureRoute({ provider: "p1", model: "m3" });
+  assert.equal(clean.status, "ok");
+  assert.equal(writes.length, writesBefore, "nothing was written for a correct row");
+});
+
+test("probe: the switch off means the plugin does nothing at all", async () => {
+  const doctor = new probeMod.CompactionDoctor(makeCtx({}), { fallbackContextWindow: 512000 });
+  assert.equal(doctor.config.enabled, false, "the single switch defaults to off");
+  assert.equal(doctor.config.autoRepair, true, "auto repair is on once the switch is on");
+  assert.equal(doctor.config.probeOnStart, false, "the v0.2 startup sweep is gone");
+
+  let ran = 0;
+  doctor.run = async () => {
+    ran += 1;
+    return {};
+  };
+  assert.deepEqual(await doctor.ensureRoute({ provider: "p", model: "m" }), { skipped: "disabled" });
+  doctor._lazyCheck(undefined);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(ran, 0, "nothing was probed");
+  assert.equal(doctor.autoState.size, 0, "no route was remembered");
+  assert.deepEqual(doctor._autoStatus(), { key: "auto.off", params: {} });
+
+  const armed = new probeMod.CompactionDoctor(makeCtx({ sessions: { active: () => undefined } }), { enabled: true });
+  assert.deepEqual(armed._autoStatus(), { key: "auto.none", params: {} }, "no session yet");
+});
+
+test("engine: the single switch (probe row) actually reaches the engine", async () => {
+  // The settings page has exactly one control. If this layering breaks, flipping
+  // it would change the probe's behavior while compaction stayed untouched — the
+  // switch would look broken.
+  const make = (extra) =>
+    new engineMod.CompactionDoctorEngine(
+      makeCtx({
+        llm: fakeLlm,
+        tokenMeter: makeMeter(() => measurementOf(pricedNodes(200, 233), 930386)),
+        sessions: { active: () => makeSession(conversationEvents()) },
+        ...extra,
+      }),
+      { scaleMode: "meter" },
+    );
+
+  const off = make({});
+  assert.equal(off.doctorConfig().enabled, false, "off by default");
+  assert.equal(
+    await off.compactIfNeeded(makeAgent(makeSession(conversationEvents())), "pressure", undefined),
+    null,
+    "while the switch is off the doctor does nothing at all",
+  );
+
+  // The switch writes `enabled` on the probe row; the engine must pick it up.
+  const on = make({ compactionDoctor: { config: { enabled: true } } });
+  assert.equal(on.doctorConfig().enabled, true, "the probe row's switch wins");
+  await on.compactIfNeeded(makeAgent(makeSession(conversationEvents())), "pressure", undefined);
+  assert.equal(on.calls.compactIfNeeded.length, 1, "and the shipped backend is then consulted");
 });
 
 // ---------------------------------------------------------------------------

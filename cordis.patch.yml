@@ -28,23 +28,30 @@
     - id: compaction-doctor-client
       name: '@local/dsh-compaction-doctor'
 
-    # Upstream capability probe + settings-page transport + diagnostic report.
+    # Upstream capability probe + settings-page transport + automatic repair.
     #
     # This row's Config is marked `.volatile()`, which is what makes it a
-    # settings namespace: the browser reads and writes these fields through
-    # `ctx.configForms.get('compaction-doctor')` with no registration step.
-    # `writeConfig` defaults to false on purpose — a discovered value is only
-    # written when the user presses 「一键修复」, never on startup.
+    # settings namespace and what `PUT /config {"enabled":…}` writes. The page
+    # itself is one switch; everything else here is a tuning knob for the file.
+    # Nothing is written on startup: a value is only ever corrected for a model
+    # the running session actually uses, and only while `enabled` is true.
     - id: compaction-doctor
       name: '@local/dsh-compaction-doctor/probe'
       config:
-        enabled: true
+        # ── THE SWITCH ──────────────────────────────────────────────────────
+        # The settings page is one control: this flag. Off (the default) means
+        # the plugin is completely inert — no probing, no writing, stock
+        # compaction behavior. On means: for the model the session in use is
+        # actually talking to, check once and correct the row if it disagrees
+        # with what the provider really accepts (byte-for-byte backup first).
+        # `autoRepair` (below) can only ever run while this is true.
+        enabled: false
+        autoRepair: true
         # Fallback route for a brand-new session; a live `request/context` wins.
         provider: huaiyuan
         model: DeepSeek-V4.1-Flash
         providerEntryId: llm-pi-ai
         engineEntryId: compaction-doctor-engine
-        probeOnStart: true
         writeConfig: false
         overflowRecovery: true
         capMaxTokens: 65536

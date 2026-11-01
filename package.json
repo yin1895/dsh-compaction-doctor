@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-compaction-doctor",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "type": "module",
   "description": "DSH 上下文压缩插件：设置里一个开关，打开后按你正在使用的模型自动校正上下文长度配置（改前逐字节备份）；关掉即完全惰性。",

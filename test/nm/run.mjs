@@ -2293,6 +2293,265 @@ testIsolated("F6: the switch off and scaleMode off leave every override inert, i
 });
 
 // ---------------------------------------------------------------------------
+// task-15: the host half must mount on the real host
+// ---------------------------------------------------------------------------
+
+/**
+ * A context with cordis's real `get` semantics: `ctx.get(name)` **throws** for a
+ * service that is not mounted (`cordis/lib/index.js:763` `get(name, strict = true)`),
+ * `inject(names, cb)` runs the callback when those services appear, and `effect`
+ * drives generators.
+ */
+function makeHostCtx({ services = {}, provide = [], strict = true } = {}) {
+  const listeners = new Map();
+  const injections = [];
+  const ctx = {
+    logger: makeLogger(),
+    _services: new Map(Object.entries(services)),
+    get(name) {
+      if (ctx._services.has(name)) return ctx._services.get(name);
+      if (strict) throw new Error(`cannot get property "${name}" without it being provided`);
+      return undefined;
+    },
+    provide(name, value) {
+      ctx._services.set(name, value);
+      for (const injection of [...injections]) {
+        if (injection.names.every((required) => ctx._services.has(required))) {
+          injections.splice(injections.indexOf(injection), 1);
+          injection.callback(ctx);
+        }
+      }
+    },
+    on(type, handler) {
+      const list = listeners.get(type) ?? [];
+      list.push(handler);
+      listeners.set(type, list);
+      return () => {};
+    },
+    effect(generator) {
+      const iterator = generator();
+      let step = iterator.next();
+      while (step.done !== true) step = iterator.next();
+      return () => {};
+    },
+    async emitEvent(type, ...args) {
+      let result;
+      for (const handler of listeners.get(type) ?? []) result = await handler(...args);
+      return result;
+    },
+    __injections: injections,
+  };
+  for (const injection of provide) injections.push(injection);
+  return ctx;
+}
+
+/** A web server stub that records what it was asked to serve. */
+function makeWebServer(routes) {
+  return {
+    register(route) {
+      routes.push({ kind: route.kind, path: route.path, handler: route.handler });
+      return () => {};
+    },
+  };
+}
+
+/** The doctor capabilities the transport requires. */
+function makeDoctorStub() {
+  return {
+    stateSnapshot: async () => ({ ok: true, version: "test" }),
+    diagnose: async () => ({}),
+    applyFix: async () => ({ ok: true }),
+    readConfigView: async () => ({}),
+    writeConfigPatch: async () => ({ ok: true }),
+    listBackups: async () => [],
+    restoreBackup: async () => ({ ok: true }),
+  };
+}
+
+testIsolated("task-15: the settings route survives a web server that mounts AFTER us (the live 404)", async () => {
+  const routes = [];
+  const ctx = makeHostCtx({});
+  ctx.inject = (names, callback) => {
+    ctx.__injections.push({ names: [...names], callback });
+  };
+  const doctor = makeDoctorStub();
+  // 1. No web server yet: the route is deferred, not abandoned.
+  const first = statusMod.installStatusRoute(ctx, doctor, { prefix: "/dsh-compaction-doctor", headerName: "x-compaction-doctor" });
+  assert.equal(first.installed, false);
+  assert.equal(first.deferred, true, "a missing web server must defer, never silently give up");
+  assert.equal(routes.length, 0);
+  assert.equal(ctx.__injections.length, 1, "exactly one deferred registration was armed");
+
+  // 2. The web server row finishes importing and provides the service.
+  ctx.provide("webServer", makeWebServer(routes));
+  assert.equal(routes.length, 1, "the route registers the moment the service appears");
+  assert.equal(routes[0].kind, "prefix");
+  assert.equal(routes[0].path, "/dsh-compaction-doctor");
+
+  // 3. And it then answers the settings page's own request.
+  const answered = [];
+  const res = {
+    statusCode: 0,
+    headers: {},
+    setHeader(name, value) { this.headers[name] = value; },
+    end(body) { answered.push({ status: this.statusCode, body }); },
+  };
+  await routes[0].handler({ method: "GET", url: "/dsh-compaction-doctor/state", headers: { "x-compaction-doctor": "1" } }, res);
+  assert.equal(answered[0].status, 200, "the deferred route serves GET /state");
+  assert.match(answered[0].body, /"ok":true/);
+
+  // 4. The probe's own entry point must not arm a second registration: on this
+  //    host a duplicate prefix route throws inside the web server.
+  const lateRoutes = [];
+  const lateCtx = makeHostCtx({});
+  lateCtx.inject = (names, callback) => {
+    lateCtx.__injections.push({ names: [...names], callback });
+  };
+  const lateDoctor = new probeMod.CompactionDoctor(lateCtx, { enabled: true });
+  assert.equal(lateRoutes.length, 0);
+  lateDoctor._registerRoute(lateCtx);
+  lateDoctor._registerRoute(lateCtx);
+  assert.equal(lateCtx.__injections.length, 1, "repeat calls are settled, never double-armed");
+  lateCtx.provide("webServer", makeWebServer(lateRoutes));
+  assert.equal(lateRoutes.length, 1, "and the deferred registration fires exactly once");
+});
+
+testIsolated("task-15: a host missing the APIs we touch still mounts the plugin (no throw, no silent death)", async () => {
+  const routes = [];
+  // A hostile context: strict `get` that throws for everything unknown, no
+  // `inject`, no `effect`, no host services at all.
+  const bare = {
+    logger: makeLogger(),
+    get(name) { throw new Error(`cannot get property "${name}" without it being provided`); },
+  };
+  const result = statusMod.installStatusRoute(bare, makeDoctorStub(), { prefix: "/p", headerName: "h" });
+  assert.equal(result.installed, false);
+  assert.equal(result.deferred, undefined, "a host with no ctx.inject cannot defer; it reports instead");
+  assert.match(result.reason, /no ctx\.inject|unavailable/);
+  assert.equal(routes.length, 0);
+
+  // The probe row itself: every host service it reaches for is absent.
+  const doctorService = new probeMod.CompactionDoctor(makeHostCtx({}), { enabled: true });
+  assert.ok(doctorService !== undefined, "the doctor service still constructs");
+  const snapshot = await doctorService.stateSnapshot({ signal: undefined });
+  assert.equal(snapshot.ok, true, "and still answers the settings page");
+
+  // The engine row: no tokenMeter, no llm, no sessions.
+  const engine = new engineMod.CompactionDoctorEngine(makeHostCtx({}), { enabled: true });
+  assert.ok(engine !== undefined, "the engine service still constructs");
+  assert.equal(engine.diagnostics().engine, "compaction-doctor", "and still reports diagnostics");
+  assert.ok(
+    engine.doctorStats.notes.some((note) => /meter/i.test(note)),
+    `the missing meter is recorded, not thrown: ${JSON.stringify(engine.doctorStats.notes)}`,
+  );
+});
+
+/**
+ * The load-time rule this plugin must never violate, reimplemented from
+ * `dsh-session-format-v3-to-v4/lib/index.js:731-738` (`span()`): a
+ * `compaction/summary` / `compaction/prune` record may not shadow the protected
+ * system head — not in `shadowedSeqs`, not as a `shadowedRange` endpoint. The
+ * validator has no exemption for a failed transaction, so one such record makes
+ * the whole session unloadable.
+ */
+function assertLogLoadable(events, protectedHead) {
+  for (const event of events) {
+    if (event.type !== "compaction/summary" && event.type !== "compaction/prune") continue;
+    const seqs = Array.isArray(event.data?.shadowedSeqs) ? event.data.shadowedSeqs : [];
+    const range = event.data?.shadowedRange ?? {};
+    if (seqs.includes(protectedHead) || range.start === protectedHead || range.end === protectedHead) {
+      throw new Error(`SessionFormatError: compaction cannot shadow the protected system head (record ${event.seq})`);
+    }
+  }
+  return true;
+}
+
+/** The host's own commit order (`dsh-compaction-basic:628-661`): record, then replace. */
+async function commitLikeHost(start, end, agent) {
+  const session = agent.session;
+  const nodes = session.surface.nodes;
+  const shadowed = nodes.slice(nodes.indexOf(start), nodes.indexOf(end) + 1);
+  session.append("compaction/summary", { shadowedRange: { start, end }, shadowedSeqs: shadowed, summary: [{ type: "text", text: "s" }] });
+  session.append("user/message", { role: "user", content: [{ type: "text", text: "checkpoint" }] }, {
+    surfaceOp: { op: "replace", startSeq: start, endSeq: end },
+    sourceEventSeqs: shadowed,
+  });
+  return { via: "region", start, end };
+}
+
+testIsolated("task-15: compactRegion is the single gate — a head-addressed range is shifted, not committed", async () => {
+  const { session, engine, agent } = richConversation();
+  const head = session.surface.nodes[0];
+  const next = session.surface.nodes[1];
+  assert.equal(session.eventAt(head).type, "system/message", "the harness really has a protected head");
+
+  // A caller that gets the range wrong — the shape a future rung could produce.
+  const result = await withPatched({ compactRegion: commitLikeHost }, () =>
+    engine.compactRegion(head, session.surface.nodes[4], agent, undefined),
+  );
+  assert.equal(result.start, next, "the range was moved off the head before the host saw it");
+  assert.equal(engine.doctorStats.headShifts, 1);
+  assert.equal(engine.doctorStats.lastHeadShift.head, head);
+  assert.equal(engine.doctorStats.lastHeadShift.to, next);
+  assert.ok(session.surface.replaceGeneration > 0, "and the compaction still committed");
+  assert.ok(
+    engine.ctx.logger.seen.some(([level, line]) => level === "warn" && /protected system head/.test(line)),
+    "the correction is narrated",
+  );
+  const record = session.log.find((event) => event.type === "compaction/summary");
+  assert.ok(!record.data.shadowedSeqs.includes(head), "the written record never names the head");
+  assert.equal(assertLogLoadable(session.log, head), true, "so the log still loads");
+});
+
+testIsolated("task-15: every rung passes the same gate, and a failed commit leaves a loadable log", async () => {
+  // 1. The validator has teeth: the exact shape the real incident produced is rejected.
+  const { session: victim } = richConversation();
+  const head = victim.surface.nodes[0];
+  const poisoned = [{ seq: 0, type: "compaction/summary", data: { shadowedRange: { start: head, end: head + 2 }, shadowedSeqs: [head, head + 1, head + 2] } }];
+  assert.throws(() => assertLogLoadable(poisoned, head), /cannot shadow the protected system head/);
+
+  // 2. Through the ladder, the gate is in the path, so the record cannot name the head.
+  const ladder = richConversation();
+  const outcome = await withPatched(
+    { compactRegion: commitLikeHost, summarize: async () => ({ summary: [{ type: "text", text: "s" }], rawOutput: [], usage: undefined }) },
+    () => ladder.engine.compactIfNeeded(ladder.agent, "context-overflow", undefined),
+  );
+  assert.notEqual(outcome, null, "the ladder still commits");
+  const record = ladder.session.log.find((event) => event.type === "compaction/summary");
+  assert.ok(record !== undefined, "the host's own record was written");
+  assert.ok(!record.data.shadowedSeqs.includes(ladder.session.surface.nodes[0]));
+  assert.equal(assertLogLoadable(ladder.session.log, ladder.session.surface.nodes[0]), true);
+
+  // 3. The half-written shape — record written, replacement refused afterwards —
+  //    still leaves a log the host's loader accepts, because the range handed over
+  //    can no longer cover the head.
+  const failing = richConversation();
+  const headSeq = failing.session.surface.nodes[0];
+  await assert.rejects(
+    () =>
+      withPatched(
+        {
+          compactRegion: async (start, end, target) => {
+            const nodes = target.session.surface.nodes;
+            const shadowed = nodes.slice(nodes.indexOf(start), nodes.indexOf(end) + 1);
+            target.session.append("compaction/summary", { shadowedRange: { start, end }, shadowedSeqs: shadowed });
+            throw new Error("surface replace refused after the record was written");
+          },
+        },
+        // The caller asks for a head-covering range; the gate corrects it first.
+        () => failing.engine.compactRegion(headSeq, failing.session.surface.nodes[3], failing.agent, undefined),
+      ),
+    /refused after the record was written/,
+  );
+  assert.ok(failing.session.log.some((event) => event.type === "compaction/summary"), "the record really was written");
+  assert.equal(
+    assertLogLoadable(failing.session.log, headSeq),
+    true,
+    "and the half-written log is still loadable — it never shadowed the head",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // run
 // ---------------------------------------------------------------------------
 

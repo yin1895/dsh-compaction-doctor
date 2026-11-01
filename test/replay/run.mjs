@@ -40,6 +40,7 @@ import {
   SAFETY_MARGIN_TOKENS,
   sandboxHome,
   SUMMARY_INSTRUCTION_TOKENS,
+  SYNTHETIC_ROUTE,
   syncLib,
   verifyLibCopy,
 } from "./harness.mjs";
@@ -143,11 +144,6 @@ record(
 
 // Sanitisation guard: every string is either a kept verbatim value or pure filler.
 const FILLER_ONLY = /^[x\u00a1\u6d4b\u10348]*$/u;
-const KEPT_OK = new Set([
-  ...Object.values({
-    type: "ok", _: "ok",
-  }),
-]);
 const keptStrings = [];
 let fillerStrings = 0;
 const walk = (value, keyPath) => {
@@ -170,12 +166,26 @@ for (const entry of fixture.entries) walk(entry, entry.type);
 
 const PRIVATE_MARKERS = ["C:\\", "D:\\", "/Users/", "Administrator", "auditagent", ".dsh", "cyber_workspace", "sha256:"];
 const leaked = PRIVATE_MARKERS.filter((marker) => fixture.text.includes(marker));
+// The two identifiers that would point at the operator: the failing session's id
+// and the private gateway label. `test/fixtures/build.mjs` substitutes same-length
+// synthetic values (an `x`-masked id that no shape-based scanner matches, and
+// `gw-<i>` for the label); the fixture may only ever carry those.
+const HEX_SESSION_ID_RE = /session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gu;
+const SYNTHETIC_SESSION_ID_RE = /session-x{8}-x{4}-x{4}-x{4}-x{12}/gu;
+const hexShapedIds = fixture.text.match(HEX_SESSION_ID_RE) ?? [];
+const syntheticIds = fixture.text.match(SYNTHETIC_SESSION_ID_RE) ?? [];
+const syntheticRoute = /^gw-\d+$/u.test(String(fixture.route.provider)) && fixture.route.provider.length === 8;
 record(
   "fixture:sanitised",
-  "no machine path, account name or attachment hash survived",
-  leaked.length === 0,
-  leaked.length === 0 ? `${fillerStrings} filler strings, ${keptStrings.length} kept strings` : leaked.join(","),
-  leaked,
+  "no machine path, account name, hash or real identifier survived",
+  leaked.length === 0 && syntheticRoute && hexShapedIds.length === 0 && syntheticIds.length === 4,
+  `${fillerStrings} filler strings, ${keptStrings.length} non-filler strings; route=${fixture.route.provider} (synthetic, ${String(fixture.route.provider).length} chars); session ids: ${hexShapedIds.length} hex-shaped, ${syntheticIds.length} synthetic (${syntheticIds[0]?.length ?? 0} chars)`,
+  [
+    ...leaked,
+    ...(syntheticRoute ? [] : ["the fixture's route label is not the synthetic shape"]),
+    ...(hexShapedIds.length === 0 ? [] : [`${hexShapedIds.length} hex-shaped session id(s) survived`]),
+    ...(syntheticIds.length === 4 ? [] : [`expected 4 synthetic session ids, found ${syntheticIds.length}`]),
+  ],
 );
 
 // The only Chinese text left must be the recorded provider message.
@@ -355,7 +365,7 @@ for (const window of WINDOWS) {
             // Without a resolvable route the engine cannot price a request at all and
             // hands the whole job to the shipped path — so the grid must state one.
             compactionDoctor: {
-              config: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", fallbackContextWindow: window },
+              config: { provider: SYNTHETIC_ROUTE, model: "DeepSeek-V4.1-Flash", fallbackContextWindow: window },
             },
           });
           const engine = new engineMod.CompactionDoctorEngine(ctx, {
@@ -368,7 +378,7 @@ for (const window of WINDOWS) {
           });
           const session = makeSession([
             { seq: 1, type: "system/message", data: { message: { role: "system", content: [] } } },
-            { seq: 2, type: "request/context", data: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: window } },
+            { seq: 2, type: "request/context", data: { provider: SYNTHETIC_ROUTE, model: "DeepSeek-V4.1-Flash", contextWindow: window } },
           ]);
           const agent = makeAgent(session, maxOutput);
 
@@ -487,7 +497,7 @@ for (const window of NODE0_WINDOWS) {
           // really is the `system/message` the contract protects.
           compactionDoctor: {
             config: {
-              provider: "huaiyuan",
+              provider: SYNTHETIC_ROUTE,
               model: "DeepSeek-V4.1-Flash",
               fallbackContextWindow: window,
               ...(route === "override" ? { thresholdRatio: 0.5 } : {}),

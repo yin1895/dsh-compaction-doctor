@@ -39,6 +39,16 @@ export const PLUGIN_TOKENS_PER_BYTE = 0.34;
  * covers the whole outgoing request, not only the chunk payload.
  */
 export const SUMMARY_INSTRUCTION_TOKENS = 1024;
+/**
+ * The synthetic gateway label the synthetic grids (B3/B4) route through.
+ *
+ * The fixture must not carry the real gateway id: `test/fixtures/build.mjs`
+ * replaces every `provider` field value with a same-length `gw-<i>` label before
+ * the fixture is written. The grids use the same shape, and the fixture guard
+ * asserts the fixture's own route really has it — so a drift between generator
+ * and harness fails the suite instead of silently changing what is tested.
+ */
+export const SYNTHETIC_ROUTE = "gw-00000";
 
 /**
  * Copy `lib/*.js` next to the harness so the engine's bare imports resolve to

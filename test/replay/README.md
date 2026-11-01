@@ -62,17 +62,18 @@ test/replay/
 
 ## 5. 负向对照（证明这套件会红）
 
-用 git 里的**修复前**引擎（HEAD，695 行的 `lib/engine.js`）跑同一套件：
+用 git 里的**修复前**引擎跑同一套件。**要钉住修复前的那个 commit**：`HEAD` 现在已经包含修复，
+拿它当对照只会得到 19/19。`137065b` 是修复前最后一个提交（`lib/engine.js` 695 行）：
 
 ```powershell
-git archive HEAD lib | tar -x --strip-components=1 -C "$env:TEMP\cdoc-head-lib"
-$env:REPLAY_LIB_DIR = "$env:TEMP\cdoc-head-lib"; node test/replay/run.mjs
+git archive 137065b lib | tar -x --strip-components=1 -C "$env:TEMP\cdoc-prefix-lib"
+$env:REPLAY_LIB_DIR = "$env:TEMP\cdoc-prefix-lib"; node test/replay/run.mjs
 ```
 
 | revision | 结果 | 红的是哪些 |
 |---|---|---|
-| `HEAD`（修复前） | **10/19** | `replay:surface-advances` `replay:one-level-succeeds` `replay:turn-survives` `replay:no-doomed-request` `size:property`(466) `size:degrades`(33) `size:summary-contract`(88) `node0:ranges`(34) `node0:contract-path`(34) |
-| 当前工作树（task-10 修复后） | **19/19** | — |
+| `137065b`（修复前） | **10/19** | `replay:surface-advances` `replay:one-level-succeeds` `replay:turn-survives` `replay:no-doomed-request` `size:property`(466) `size:degrades`(33) `size:summary-contract`(88) `node0:ranges`(34) `node0:contract-path`(34) |
+| 当前工作树（修复后） | **19/19** | — |
 
 修复前那次重放的实测一行，就是历史本身：
 
@@ -84,5 +85,5 @@ outcome=undefined generation=0 commits=0 errors=[node0,overflow] baseRequest=407
 
 ## 6. 待办
 
-- `test/replay/lib/` 是每次运行重新生成的拷贝，应像 `test/nm/lib/` 一样进 `.gitignore`
+- `test/replay/lib/` 是每次运行重新生成的拷贝，应当像 `test/nm/lib/` 一样进 `.gitignore`
   （`.gitignore` 在本次改动范围之外，留给 lead 一行解决）。

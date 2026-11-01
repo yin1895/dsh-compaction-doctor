@@ -177,7 +177,7 @@ function makeEvent(seq, type, data) {
 function conversationEvents({ dialogue = 4, live = undefined } = {}) {
   const events = [
     makeEvent(1, "turn/start", {}),
-    makeEvent(2, "request/context", live ?? { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 1048576 }),
+    makeEvent(2, "request/context", live ?? { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 1048576 }),
   ];
   for (let i = 0; i < dialogue; i += 1) events.push(makeEvent(3 + i, "assistant/message", { usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 } }));
   return events;
@@ -373,8 +373,8 @@ const PROFILE_PATCH = [
   "    name: '@deepseek-ai/dsh-llm-pi-ai'",
   "    config:",
   "      providers:",
-  "        huaiyuan:",
-  "          apiKeyEnv: HUAIYUAN_API_KEY",
+  "        exampleGateway:",
+  "          apiKeyEnv: EXAMPLE_GATEWAY_API_KEY",
   "          api: openai-completions",
   "          baseURL: http://127.0.0.1:17890/v1",
   "          models:",
@@ -394,7 +394,7 @@ const PROFILE_PATCH = [
 test("probe: rewriteModelWindow repairs the routed model and leaves every sibling row byte-identical", () => {
   const result = probeMod.rewriteModelWindow(PROFILE_PATCH.join("\n"), {
     providerEntryId: "llm-pi-ai",
-    provider: "huaiyuan",
+    provider: "exampleGateway",
     model: "DeepSeek-V4.1-Flash",
     contextWindow: 1048576,
     maxTokens: 65536,
@@ -406,7 +406,7 @@ test("probe: rewriteModelWindow repairs the routed model and leaves every siblin
   assert.ok(result.text.includes("              input:\n                - text\n"), "later keys of the patched model survive");
   const again = probeMod.rewriteModelWindow(result.text, {
     providerEntryId: "llm-pi-ai",
-    provider: "huaiyuan",
+    provider: "exampleGateway",
     model: "DeepSeek-V4.1-Flash",
     contextWindow: 1048576,
     maxTokens: 65536,
@@ -417,7 +417,7 @@ test("probe: rewriteModelWindow repairs the routed model and leaves every siblin
 test("probe: rewriteModelWindow refuses a model it cannot find", () => {
   const result = probeMod.rewriteModelWindow(PROFILE_PATCH.join("\n"), {
     providerEntryId: "llm-pi-ai",
-    provider: "huaiyuan",
+    provider: "exampleGateway",
     model: "does-not-exist",
     contextWindow: 1048576,
     maxTokens: 65536,
@@ -427,21 +427,21 @@ test("probe: rewriteModelWindow refuses a model it cannot find", () => {
 });
 
 test("probe: readProviderSetup extracts the transport facts of the routed provider", () => {
-  const setup = probeMod.readProviderSetup(PROFILE_PATCH.join("\n"), "huaiyuan");
+  const setup = probeMod.readProviderSetup(PROFILE_PATCH.join("\n"), "exampleGateway");
   assert.equal(setup.baseURL, "http://127.0.0.1:17890/v1");
-  assert.equal(setup.apiKeyEnv, "HUAIYUAN_API_KEY");
+  assert.equal(setup.apiKeyEnv, "EXAMPLE_GATEWAY_API_KEY");
   assert.equal(setup.api, "openai-completions");
 });
 
 test("probe: patchConfigModel updates both array-shaped and map-shaped model tables", () => {
-  const arrayShape = { providers: { huaiyuan: { models: [{ id: "DeepSeek-V4.1-Flash", contextWindow: 512000, maxTokens: 384000 }] } } };
-  const patched = probeMod.patchConfigModel(arrayShape, "huaiyuan", "DeepSeek-V4.1-Flash", { contextWindow: 1048576, maxTokens: 65536 });
-  assert.deepEqual(patched.providers.huaiyuan.models[0], { id: "DeepSeek-V4.1-Flash", contextWindow: 1048576, maxTokens: 65536 });
-  assert.equal(arrayShape.providers.huaiyuan.models[0].contextWindow, 512000, "the input object is never mutated");
-  const mapShape = { providers: { huaiyuan: { models: { "DeepSeek-V4.1-Flash": { contextWindow: 512000 } } } } };
-  const mapPatched = probeMod.patchConfigModel(mapShape, "huaiyuan", "DeepSeek-V4.1-Flash", { contextWindow: 1048576, maxTokens: 65536 });
-  assert.equal(mapPatched.providers.huaiyuan.models["DeepSeek-V4.1-Flash"].contextWindow, 1048576);
-  assert.throws(() => probeMod.patchConfigModel(arrayShape, "huaiyuan", "nope", { contextWindow: 1, maxTokens: 1 }), /not present/);
+  const arrayShape = { providers: { exampleGateway: { models: [{ id: "DeepSeek-V4.1-Flash", contextWindow: 512000, maxTokens: 384000 }] } } };
+  const patched = probeMod.patchConfigModel(arrayShape, "exampleGateway", "DeepSeek-V4.1-Flash", { contextWindow: 1048576, maxTokens: 65536 });
+  assert.deepEqual(patched.providers.exampleGateway.models[0], { id: "DeepSeek-V4.1-Flash", contextWindow: 1048576, maxTokens: 65536 });
+  assert.equal(arrayShape.providers.exampleGateway.models[0].contextWindow, 512000, "the input object is never mutated");
+  const mapShape = { providers: { exampleGateway: { models: { "DeepSeek-V4.1-Flash": { contextWindow: 512000 } } } } };
+  const mapPatched = probeMod.patchConfigModel(mapShape, "exampleGateway", "DeepSeek-V4.1-Flash", { contextWindow: 1048576, maxTokens: 65536 });
+  assert.equal(mapPatched.providers.exampleGateway.models["DeepSeek-V4.1-Flash"].contextWindow, 1048576);
+  assert.throws(() => probeMod.patchConfigModel(arrayShape, "exampleGateway", "nope", { contextWindow: 1, maxTokens: 1 }), /not present/);
 });
 
 test("probe: writeProfilePatch backs up, rewrites atomically and verifies", () => {
@@ -466,8 +466,8 @@ const OBSERVED = {
   maxAcceptedPrompt: 1036863,
   maxAcceptedSeq: 643,
   windowsSeen: [
-    { contextWindow: 1048576, provider: "huaiyuan", model: "DeepSeek-V4.1-Flash" },
-    { contextWindow: 512000, provider: "huaiyuan", model: "DeepSeek-V4.1-Flash" },
+    { contextWindow: 1048576, provider: "exampleGateway", model: "DeepSeek-V4.1-Flash" },
+    { contextWindow: 512000, provider: "exampleGateway", model: "DeepSeek-V4.1-Flash" },
   ],
   attempts: 5,
   failures: 5,
@@ -475,7 +475,7 @@ const OBSERVED = {
 
 test("probe: the configured 512k window contradicts traffic the provider already accepted", () => {
   const decision = probeMod.reconcileWindow({
-    configured: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 512000, maxOutput: 384000 },
+    configured: { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 512000, maxOutput: 384000 },
     observed: OBSERVED,
     adapter: { source: "llm.listModels", contextWindow: 1048576, maxOutput: 131072 },
     capMaxTokens: 65536,
@@ -490,7 +490,7 @@ test("probe: the configured 512k window contradicts traffic the provider already
 
 test("probe: a repaired profile keeps the window and only reports the unenforced reserve", () => {
   const decision = probeMod.reconcileWindow({
-    configured: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 1048576, maxOutput: 65536 },
+    configured: { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 1048576, maxOutput: 65536 },
     observed: OBSERVED,
     adapter: { source: "llm.listModels", contextWindow: 1048576, maxOutput: 131072 },
     capMaxTokens: 65536,
@@ -502,7 +502,7 @@ test("probe: a repaired profile keeps the window and only reports the unenforced
 
 test("probe: with no catalog and no traffic the configured value is the only candidate", () => {
   const decision = probeMod.reconcileWindow({
-    configured: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 200000, maxOutput: 16384 },
+    configured: { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 200000, maxOutput: 16384 },
     observed: {},
     capMaxTokens: 65536,
   });
@@ -528,8 +528,8 @@ test("probe: readObservedBracket counts a prompt as inputTokens + cacheReadToken
 });
 
 test("probe: readObservedBracket follows the request/context window", () => {
-  const bracket = probeMod.readObservedBracket(makeSession(conversationEvents({ dialogue: 2, live: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 512000 } })));
-  assert.deepEqual(bracket.windowsSeen, [{ contextWindow: 512000, provider: "huaiyuan", model: "DeepSeek-V4.1-Flash" }]);
+  const bracket = probeMod.readObservedBracket(makeSession(conversationEvents({ dialogue: 2, live: { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 512000 } })));
+  assert.deepEqual(bracket.windowsSeen, [{ contextWindow: 512000, provider: "exampleGateway", model: "DeepSeek-V4.1-Flash" }]);
 });
 
 // ---------------------------------------------------------------------------
@@ -819,14 +819,14 @@ test("probe service: registers /compact-doctor and reports the reconciled window
   process.env.DSH_HOME = dir;
   try {
     const session = makeSession([
-      ...conversationEvents({ dialogue: 2, live: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 512000 } }),
+      ...conversationEvents({ dialogue: 2, live: { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 512000 } }),
       makeEvent(50, "assistant/message", { usage: { inputTokens: 100, cacheReadTokens: 1036763, outputTokens: 12, totalTokens: 1036875 } }),
     ]);
     const commands = { registrations: [], register(registration) { commands.registrations.push(registration); return { dispose() {} }; } };
     const ctx = makeCtx({ llm: fakeLlm, sessions: { active: () => session }, commands });
     const doctor = new probeMod.CompactionDoctor(ctx, {
       enabled: true,
-      provider: "huaiyuan",
+      provider: "exampleGateway",
       model: "DeepSeek-V4.1-Flash",
       providerEntryId: "llm-pi-ai",
       writeConfig: true,
@@ -868,10 +868,10 @@ test("probe service: writeConfig disabled reports the refusal instead of touchin
   const previousHome = process.env.DSH_HOME;
   process.env.DSH_HOME = dir;
   try {
-    const session = makeSession(conversationEvents({ dialogue: 2, live: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 512000 } }));
+    const session = makeSession(conversationEvents({ dialogue: 2, live: { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 512000 } }));
     const doctor = new probeMod.CompactionDoctor(makeCtx({ llm: fakeLlm, sessions: { active: () => session } }), {
       enabled: true,
-      provider: "huaiyuan",
+      provider: "exampleGateway",
       model: "DeepSeek-V4.1-Flash",
       providerEntryId: "llm-pi-ai",
       writeConfig: false,
@@ -896,14 +896,14 @@ test("probe service: the config editor is preferred when the harness exposes one
       return [{ id: "llm-pi-ai" }];
     },
     async edit(entry, mutate) {
-      edits.push({ entry, next: mutate({ providers: { huaiyuan: { models: [{ id: "DeepSeek-V4.1-Flash", contextWindow: 512000, maxTokens: 384000 }] } } }) });
+      edits.push({ entry, next: mutate({ providers: { exampleGateway: { models: [{ id: "DeepSeek-V4.1-Flash", contextWindow: 512000, maxTokens: 384000 }] } } }) });
       return { applied: true };
     },
   };
-  const session = makeSession(conversationEvents({ dialogue: 2, live: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 200000 } }));
+  const session = makeSession(conversationEvents({ dialogue: 2, live: { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 200000 } }));
   const doctor = new probeMod.CompactionDoctor(makeCtx({ llm: fakeLlm, sessions: { active: () => session }, configEditor: editor }), {
     enabled: true,
-    provider: "huaiyuan",
+    provider: "exampleGateway",
     model: "DeepSeek-V4.1-Flash",
     providerEntryId: "llm-pi-ai",
     writeConfig: true,
@@ -914,13 +914,13 @@ test("probe service: the config editor is preferred when the harness exposes one
   const report = await doctor.run({ session, write: true });
   assert.equal(edits.length, 1);
   assert.equal(report.written.used, "configEditor");
-  assert.equal(edits[0].next.providers.huaiyuan.models[0].contextWindow, 1048576);
+  assert.equal(edits[0].next.providers.exampleGateway.models[0].contextWindow, 1048576);
 });
 
 test("probe service: report text renders every decision line", () => {
   const text = probeMod.formatReport({
     at: "2026-10-29T22:00:00.000Z",
-    route: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 512000, source: "request/context" },
+    route: { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 512000, source: "request/context" },
     configured: { contextWindow: 512000, maxOutput: 384000 },
     observed: OBSERVED,
     decision: {
@@ -1060,8 +1060,8 @@ test("status: setRowConfigKeys rewrites one row's config in place and leaves eve
     "  name: '@deepseek-ai/dsh-llm-pi-ai'",
     "  config:",
     "    providers:",
-    "      huaiyuan:",
-    "        apiKeyEnv: HUAIYUAN_API_KEY",
+    "      exampleGateway:",
+    "        apiKeyEnv: EXAMPLE_GATEWAY_API_KEY",
     "",
     "- insert:",
     "    - id: compaction-doctor",
@@ -1079,7 +1079,7 @@ test("status: setRowConfigKeys rewrites one row's config in place and leaves eve
   assert.match(replaceOnly.text, /^ {8}writeConfig: true$/mu, "the existing key is replaced at its own indent");
   assert.ok(replaceOnly.text.includes("enabled: true"), "sibling keys survive");
   assert.ok(replaceOnly.text.includes("# leading comment stays"), "unrelated lines are byte-identical");
-  assert.ok(replaceOnly.text.includes("apiKeyEnv: HUAIYUAN_API_KEY"), "another row's config is untouched");
+  assert.ok(replaceOnly.text.includes("apiKeyEnv: EXAMPLE_GATEWAY_API_KEY"), "another row's config is untouched");
 
   const withInsert = statusMod.setRowConfigKeys(replaceOnly.text, "compaction-doctor", { scaleMode: "select" });
   assert.equal(withInsert.changed, true);
@@ -1152,7 +1152,7 @@ test("status: the route installs on webServer and serves a real state request", 
   const payload = JSON.parse(ok.body);
   assert.equal(payload.ok, true);
   assert.equal(payload.host.route, "/dsh-compaction-doctor");
-  assert.equal(payload.session.route.provider, "huaiyuan");
+  assert.equal(payload.session.route.provider, "exampleGateway");
   assert.ok(payload.measurement.nodes > 0, "the status card gets real pricing");
   // No compaction service is mounted in this fixture, and the card must say so
   // instead of inventing a scale mode.
@@ -1246,8 +1246,8 @@ test("bundle: index.js exposes every documented entry point", () => {
   assert.equal(util.estimateTokens("abcd", 0.34), 2);
   assert.equal(util.readContextWindow({ top_provider: { context_length: 12345 } }), 12345);
   assert.equal(util.readContextWindow({ context_window: 4096 }), 4096);
-  assert.equal(util.latestRoute(makeSession(conversationEvents()), { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash" }).source, "request/context");
-  assert.equal(util.latestRoute(makeSession([]), { provider: "huaiyuan" }), undefined);
+  assert.equal(util.latestRoute(makeSession(conversationEvents()), { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash" }).source, "request/context");
+  assert.equal(util.latestRoute(makeSession([]), { provider: "exampleGateway" }), undefined);
 });
 
 test("bundle: the patch keeps a bare-name row so the browser half is discovered", () => {
@@ -1287,7 +1287,7 @@ test("status: the plain verdict is plain language, and leaks no internal vocabul
   const ok = doctor._plainView({
     configured: { contextWindow: 1048576, maxOutput: 65536 },
     decision: { contextWindow: 1048576, maxOutput: 65536 },
-    route: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash" },
+    route: { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash" },
   });
   assert.equal(ok.level, "ok");
   assert.match(ok.text, /没有发现问题/u);
@@ -1295,7 +1295,7 @@ test("status: the plain verdict is plain language, and leaks no internal vocabul
   const warn = doctor._plainView({
     configured: { contextWindow: 950127, maxOutput: 384000 },
     decision: { contextWindow: 1048576, maxOutput: 65536 },
-    route: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash" },
+    route: { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash" },
   });
   assert.equal(warn.level, "warn");
   assert.match(warn.text, /950127/u, "the current value is quoted");
@@ -1326,7 +1326,7 @@ test("probe: a verified write beats the stale session snapshot", () => {
     fallbackContextWindow: 512000,
     capMaxTokens: 65536,
   });
-  const stale = { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 950127 };
+  const stale = { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 950127 };
   assert.equal(doctor._configuredFor(stale).contextWindow, 950127);
   assert.equal(doctor._configuredFor(stale).maxOutput, 65536);
   assert.equal(doctor._configuredFor(undefined).contextWindow, 512000, "no session yet: the fallback stands");
@@ -1563,16 +1563,16 @@ test("harness: no test can ever touch a real profile", () => {
 
 test("probe: nothing provider-specific is baked in — the row is found by provider", () => {
   const text = PROFILE_PATCH.join("\n");
-  const byId = probeMod.rewriteModelWindow(text, { providerEntryId: "llm-pi-ai", provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 1048576, maxTokens: 65536 });
+  const byId = probeMod.rewriteModelWindow(text, { providerEntryId: "llm-pi-ai", provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 1048576, maxTokens: 65536 });
   assert.equal(byId.changed, true, byId.reason);
 
   // With no configured row id the row is located by the provider block it declares.
-  const located = probeMod.rewriteModelWindow(text, { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 1048576, maxTokens: 65536 });
+  const located = probeMod.rewriteModelWindow(text, { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 1048576, maxTokens: 65536 });
   assert.equal(located.changed, true, located.reason);
   assert.equal(located.text, byId.text, "locating by provider and by row id agree byte for byte");
 
   // A stale id must not stop the search: the id is a hint, the provider is the fact.
-  const wrongId = probeMod.rewriteModelWindow(text, { providerEntryId: "no-such-row", provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 1048576, maxTokens: 65536 });
+  const wrongId = probeMod.rewriteModelWindow(text, { providerEntryId: "no-such-row", provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 1048576, maxTokens: 65536 });
   assert.equal(wrongId.changed, true, "a hint that misses must not defeat the provider search");
   assert.equal(wrongId.text, byId.text);
 
@@ -1635,7 +1635,7 @@ function realSummaryShape(original) {
       summary: [{ type: "text", text }],
       rawOutput: [{ type: "reasoning", text: "thinking about the region" }, { type: "text", text }],
       llmStreamCall: true,
-      provider: "huaiyuan",
+      provider: "exampleGateway",
       model: "DeepSeek-V4.1-Flash",
       maxTokens: 65536,
       usage: output?.usage,
@@ -1669,7 +1669,7 @@ function makeRichSession(events, extra = {}) {
       return bySeq.get(seq);
     },
     requestHeader() {
-      return extra.header ?? { config: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", maxTokens: 65536 } };
+      return extra.header ?? { config: { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", maxTokens: 65536 } };
     },
     deriveEventMessage(event) {
       return event?.data?.message ?? event?.data ?? null;
@@ -1722,7 +1722,7 @@ function makeRichSession(events, extra = {}) {
 function richConversation({ messages = 12, tokenPerNode = 40000 } = {}) {
   const events = [
     makeEvent(0, "system/message", { message: { role: "system", content: [{ type: "text", text: "You are DSH." }] } }),
-    makeEvent(1, "request/context", { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 428917 }),
+    makeEvent(1, "request/context", { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", contextWindow: 428917 }),
   ];
   for (let index = 0; index < messages; index += 1) {
     events.push(makeEvent(2 + index, "assistant/message", { usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 } }));
@@ -1742,7 +1742,7 @@ function richConversation({ messages = 12, tokenPerNode = 40000 } = {}) {
       retainRatio: 0.05,
       // The configured route survives even after a replacement removes the
       // surface's own `request/context` node.
-      provider: "huaiyuan",
+      provider: "exampleGateway",
       model: "DeepSeek-V4.1-Flash",
     },
   );
@@ -2198,22 +2198,22 @@ testIsolated("F4: every chunk attempt is attributed (doc §8.14)", async () => {
 testIsolated("F5: the rejected size is written back as a hard upper bound, with a byte-exact backup", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cdoc-bounds-"));
   const file = path.join(dir, "compaction-doctor.window-bounds.json");
-  const first = learnMod.learnRejectedWindow({ provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", rejectedTokens: 401588, declaredWindow: 1048576, file });
+  const first = learnMod.learnRejectedWindow({ provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", rejectedTokens: 401588, declaredWindow: 1048576, file });
   assert.equal(first.learned, true);
   assert.equal(first.bound, 401588, "the write-back value is the rejected upper bound, exactly");
   assert.equal(first.effectiveWindow, 401588, "and the window may never exceed it again");
   assert.equal(first.backup, undefined, "the first write has nothing to back up");
   const before = fs.readFileSync(file, "utf8");
-  const larger = learnMod.learnRejectedWindow({ provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", rejectedTokens: 900000, declaredWindow: 1048576, file });
+  const larger = learnMod.learnRejectedWindow({ provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", rejectedTokens: 900000, declaredWindow: 1048576, file });
   assert.equal(larger.learned, false, "a larger rejection never raises the bound");
   assert.equal(larger.bound, 401588);
   assert.equal(learnMod.listBoundBackups(file).length, 0, "and an unchanged bound rewrites nothing");
-  const smaller = learnMod.learnRejectedWindow({ provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", rejectedTokens: 300000, declaredWindow: 1048576, file });
+  const smaller = learnMod.learnRejectedWindow({ provider: "exampleGateway", model: "DeepSeek-V4.1-Flash", rejectedTokens: 300000, declaredWindow: 1048576, file });
   assert.equal(smaller.bound, 300000, "a smaller rejection lowers it");
   const backups = learnMod.listBoundBackups(file);
   assert.equal(backups.length, 1, "the rewrite backed the previous file up first");
   assert.equal(fs.readFileSync(backups[0].file, "utf8"), before, "and that backup is byte-exact");
-  assert.equal(learnMod.readWindowBounds(file).entries["huaiyuan/DeepSeek-V4.1-Flash"], 300000);
+  assert.equal(learnMod.readWindowBounds(file).entries["exampleGateway/DeepSeek-V4.1-Flash"], 300000);
   fs.writeFileSync(file, "{ this is not json", "utf8");
   assert.deepEqual(learnMod.readWindowBounds(file).entries, {}, "a corrupt store never reads as a bound of zero");
   fs.rmSync(dir, { recursive: true, force: true });
@@ -2229,7 +2229,7 @@ testIsolated("F5: a classified overflow records the bound and the engine plans a
   assert.equal(engine.doctorStats.windowLearning.rejectedTokens, 700000);
   assert.equal(engine.doctorStats.windowLearning.bound, 700000);
   assert.equal(engine.doctorStats.windowBound, 700000);
-  assert.equal(learnMod.readWindowBounds().entries["huaiyuan/DeepSeek-V4.1-Flash"], 700000, "and it is persisted");
+  assert.equal(learnMod.readWindowBounds().entries["exampleGateway/DeepSeek-V4.1-Flash"], 700000, "and it is persisted");
   const numbers = await engine._numbersFor(agent, engine.routeFor(agent), undefined);
   assert.equal(numbers.W, 700000, "the declared 1 MiB window is capped by what the provider refused");
 });
@@ -2240,7 +2240,7 @@ testIsolated("F6: `declared` decides — a declared gateway is repaired, an offi
   const llmWithDirectory = (declared) => ({
     ...fakeLlm,
     listConfigurableProviders() {
-      return [{ provider: "huaiyuan", displayName: "huaiyuan", settingsNs: "llm-pi-ai", settingsPath: ["providers", "huaiyuan"], declared }];
+      return [{ provider: "exampleGateway", displayName: "exampleGateway", settingsNs: "llm-pi-ai", settingsPath: ["providers", "exampleGateway"], declared }];
     },
   });
   const build = (llm) => {

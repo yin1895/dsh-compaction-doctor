@@ -308,7 +308,7 @@ sandbox.fetch = async (url, init) => {
     return send(200, {
       ok: true,
       enabled: server.visible,
-      route: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash" },
+      route: { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash" },
       auto: server.visible === server.real && server.stale === 0 ? server.auto : { key: "auto.off", params: {} },
       version: "0.4.1",
       unavailable: false,
@@ -424,7 +424,7 @@ async function drive() {
   server.visible = true;
   server.auto = {
     key: "auto.fixed",
-    params: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash" },
+    params: { provider: "exampleGateway", model: "DeepSeek-V4.1-Flash" },
     backup: "cordis.patch.yml.bak-compaction-doctor-1",
   };
   tree = mount();

@@ -548,7 +548,7 @@ function engineFixture({ config = {}, services = {}, events = undefined, meter =
       sessions: { active: () => session },
       ...services,
     }),
-    { enabled: true, scaleMode: "off", ...config },
+    { enabled: true, scaleMode: "meter", ...config },
   );
   return { engine, session, agent, meter: meterService };
 }
@@ -1438,11 +1438,16 @@ test("engine: the single switch (probe row) actually reaches the engine", async 
 
   const off = make({});
   assert.equal(off.doctorConfig().enabled, false, "off by default");
-  assert.equal(
-    await off.compactIfNeeded(makeAgent(makeSession(conversationEvents())), "pressure", undefined),
-    null,
-    "while the switch is off the doctor does nothing at all",
-  );
+  // With the switch off the engine row must not disable compaction: every
+  // override stands down and the shipped engine runs untouched. The doctor
+  // contributes nothing of its own — no custom selection, no chunking, no
+  // summary requests (that is what the user's "off" has to mean).
+  const shipped = await off.compactIfNeeded(makeAgent(makeSession(conversationEvents())), "pressure", undefined);
+  assert.equal(off.calls.compactIfNeeded.length, 1, "the shipped backend is the one consulted while the switch is off");
+  assert.equal(shipped.via, "base");
+  assert.equal(off.doctorStats.selectRuns, 0, "no doctor selection path runs");
+  assert.equal(off.doctorStats.chunkedRegions, 0, "no chunking runs");
+  assert.equal(off.doctorStats.summarizeCalls, 0, "and no summary is requested at all");
 
   // The switch writes `enabled` on the probe row; the engine must pick it up.
   const on = make({ compactionDoctor: { config: { enabled: true } } });
@@ -1588,6 +1593,702 @@ test("probe: nothing provider-specific is baked in — the row is found by provi
   const row = shipped.slice(shipped.indexOf("id: compaction-doctor\n"), shipped.indexOf("id: compaction-doctor-engine"));
   for (const key of ["provider", "model", "providerEntryId", "apiKeyEnv"]) {
     assert.equal(new RegExp(`^\\s*${key}\\s*:`, "m").test(row), false, `the shipped patch must not pin ${key}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// F1-F6: the repairs that make compaction unable to fail on a gateway
+// ---------------------------------------------------------------------------
+
+const learnMod = await import("./lib/learn.js");
+// The same module instance `lib/engine.js` extends, so patching its prototype
+// reaches the engine's own `super.summarize(...)` / `super.compactIfNeeded(...)`.
+const basicStub = await import("@deepseek-ai/dsh-compaction-basic");
+const baseProto = basicStub.BasicCompactionEngine.prototype;
+
+/** Swap methods on the shipped stub for the duration of one test. */
+async function withPatched(replacements, fn) {
+  const saved = new Map();
+  for (const [name, value] of Object.entries(replacements)) {
+    saved.set(name, baseProto[name]);
+    baseProto[name] = value;
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [name, value] of saved) baseProto[name] = value;
+  }
+}
+
+/**
+ * The **real** summary result shape (`dsh-compaction-basic/lib/index.js:329-337`):
+ * `{ summary: [blocks], rawOutput: [blocks], llmStreamCall, provider, model,
+ * maxTokens, usage }`. The stub's own `{blocks}` shape is what let the engine's
+ * `collectText` look right while every real chunk came back "empty".
+ */
+function realSummaryShape(original) {
+  return async function patchedSummarize(input, agent, signal) {
+    const output = await original.call(this, input, agent, signal);
+    const count = Array.isArray(input?.messages) ? input.messages.length : 0;
+    const text = `SUMMARY(${count})`;
+    return {
+      summary: [{ type: "text", text }],
+      rawOutput: [{ type: "reasoning", text: "thinking about the region" }, { type: "text", text }],
+      llmStreamCall: true,
+      provider: "huaiyuan",
+      model: "DeepSeek-V4.1-Flash",
+      maxTokens: 65536,
+      usage: output?.usage,
+    };
+  };
+}
+
+/**
+ * A session that enforces the host's real surface rules, so a contract
+ * violation fails here the way it fails in production:
+ *  - surface-eligible events need a surfaceOp marker (`dsh-session:300-313`);
+ *  - a replace must cite every shadowed node (`:316-334`);
+ *  - the `system/message` at node 0 may only be rewritten by a
+ *    `system/message` over exactly that node (`:421-425`);
+ *  - a committed replace is what advances `replaceGeneration` (`:465-470`).
+ */
+function makeRichSession(events, extra = {}) {
+  const log = events.map((event) => ({ ...event }));
+  const bySeq = new Map(log.map((event) => [event.seq, event]));
+  const surface = { nodes: log.map((event) => event.seq), replaceGeneration: 0 };
+  const eligible = new Set(["system/message", "user/message", "assistant/message", "developer/message", "tool/result"]);
+  const appends = [];
+  const session = {
+    log,
+    surface,
+    appends,
+    get seq() {
+      return log.length;
+    },
+    eventAt(seq) {
+      return bySeq.get(seq);
+    },
+    requestHeader() {
+      return extra.header ?? { config: { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", maxTokens: 65536 } };
+    },
+    deriveEventMessage(event) {
+      return event?.data?.message ?? event?.data ?? null;
+    },
+    append(type, data, opts) {
+      const seq = log.length;
+      const event = {
+        type,
+        seq,
+        time: Date.now(),
+        data,
+        ...(opts?.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: opts.sourceEventSeqs }),
+        ...(opts?.surfaceOp === undefined ? {} : { surfaceOp: opts.surfaceOp }),
+      };
+      const op = event.surfaceOp;
+      if (op === undefined) {
+        if (eligible.has(type)) throw new Error(`session event "${type}" is surface-eligible and requires a surfaceOp marker`);
+        log.push(event);
+        bySeq.set(seq, event);
+        return event;
+      }
+      if (op === "append") {
+        surface.nodes.push(seq);
+      } else {
+        if (Object.keys(op).length !== 3) throw new Error(`session event "${type}" carries an invalid replace surfaceOp`);
+        if (op.startSeq >= seq || op.endSeq >= seq) throw new Error(`surface replace at seq ${seq}: startSeq and endSeq must reference earlier events`);
+        const startIdx = surface.nodes.indexOf(op.startSeq);
+        const endIdx = surface.nodes.indexOf(op.endSeq);
+        if (startIdx === -1 || endIdx === -1) throw new Error("surface replace: seq not found in surface");
+        const shadowed = surface.nodes.slice(startIdx, endIdx + 1);
+        const sources = Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs : [];
+        const missing = shadowed.filter((item) => sources.includes(item) === false);
+        if (missing.length > 0) throw new Error(`surface replace: sourceEventSeqs must include every shadowed surface node; missing ${missing.join(", ")}`);
+        if (startIdx === 0 && bySeq.get(surface.nodes[0])?.type === "system/message" && (type !== "system/message" || shadowed.length !== 1)) {
+          throw new Error("surface replace: node 0 holds the system prompt and may be rewritten only by a system/message over exactly that node");
+        }
+        surface.nodes.splice(startIdx, endIdx - startIdx + 1, seq);
+        surface.replaceGeneration += 1;
+      }
+      log.push(event);
+      bySeq.set(seq, event);
+      appends.push(event);
+      return event;
+    },
+  };
+  return session;
+}
+
+/** A session with a real system head, a request/context route and N messages. */
+function richConversation({ messages = 12, tokenPerNode = 40000 } = {}) {
+  const events = [
+    makeEvent(0, "system/message", { message: { role: "system", content: [{ type: "text", text: "You are DSH." }] } }),
+    makeEvent(1, "request/context", { provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", contextWindow: 428917 }),
+  ];
+  for (let index = 0; index < messages; index += 1) {
+    events.push(makeEvent(2 + index, "assistant/message", { usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 } }));
+  }
+  const session = makeRichSession(events);
+  const meter = makeMeter(() => {
+    const nodes = session.surface.nodes.map((seq) => ({ seq, tokens: tokenPerNode }));
+    return measurementOf(nodes, nodes.length * tokenPerNode);
+  });
+  const engine = new engineMod.CompactionDoctorEngine(
+    makeCtx({ llm: fakeLlm, tokenMeter: meter, sessions: { active: () => session } }),
+    {
+      enabled: true,
+      scaleMode: "select",
+      maxTokens: 65536,
+      thresholdRatio: 0.75,
+      retainRatio: 0.05,
+      // The configured route survives even after a replacement removes the
+      // surface's own `request/context` node.
+      provider: "huaiyuan",
+      model: "DeepSeek-V4.1-Flash",
+    },
+  );
+  return { session, meter, engine, agent: makeAgent(session) };
+}
+
+/**
+ * A faithful `compactRegion`: summarize first, then commit the replacement —
+ * the order the shipped transaction uses
+ * (`dsh-compaction-basic/lib/index.js:477-486`). Without this the stub's
+ * `compactRegion` could never show whether the surface actually moved.
+ */
+async function realCompactRegion(start, end, agent, signal) {
+  this.calls.compactRegion.push({ start, end });
+  const session = agent.session;
+  const nodes = session.surface.nodes;
+  const startIdx = nodes.indexOf(start);
+  const endIdx = nodes.indexOf(end);
+  const shadowed = nodes.slice(startIdx, endIdx + 1);
+  const input = { messages: shadowed.map((seq) => session.deriveEventMessage(session.eventAt(seq))) };
+  await this.summarize(input, agent, signal);
+  session.append(
+    "user/message",
+    { role: "user", id: `test-checkpoint-${start}`, content: [{ type: "text", text: "checkpoint" }] },
+    { surfaceOp: { op: "replace", startSeq: start, endSeq: end }, sourceEventSeqs: shadowed },
+  );
+  return { via: "region", start, end, shadowedSeqs: shadowed, shadowedTokenCount: shadowed.length };
+}
+
+/** Every rung floored: the summary, the shipped path and the region all fail. */
+function flooredRungs() {
+  return {
+    summarize: async () => {
+      throw new Error("summarization failed on this gateway");
+    },
+    compactIfNeeded: async () => {
+      throw new Error("the shipped path failed too");
+    },
+    compactRegion: async () => {
+      throw new Error("compactRegion refused");
+    },
+  };
+}
+
+/** An agent on a gateway route, for direct `summarize` calls. */
+function engineFixtureAgent() {
+  return makeAgent(makeSession(conversationEvents()));
+}
+
+// --- §7.3 / the recorded regression: the real summary shape -----------------
+
+/**
+ * Every F1-F6 test runs against its own profile directory.
+ *
+ * F5 persists a learned hard window bound per provider/model (that is the whole
+ * point of the repair), so without isolation one test's learned bound would
+ * silently become another test's window — which is exactly the kind of hidden
+ * cross-talk this suite exists to catch.
+ */
+function testIsolated(name, fn) {
+  test(name, async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "cdoc-f-"));
+    const previous = process.env.DSH_HOME;
+    process.env.DSH_HOME = home;
+    try {
+      await fn();
+    } finally {
+      process.env.DSH_HOME = previous;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
+
+testIsolated("shape: collectText and withMergedText read the REAL summarize result shape", () => {
+  const real = {
+    summary: [{ type: "text", text: "TEXT" }],
+    rawOutput: [{ type: "reasoning", text: "REASONING" }, { type: "text", text: "TEXT" }],
+    llmStreamCall: true,
+    usage: { inputTokens: 1 },
+  };
+  assert.equal(engineMod.collectText(real), "TEXT", "the text lives in the summary array");
+  assert.equal(
+    engineMod.collectText({ summary: [{ type: "reasoning", text: "ONLY-REASONING" }] }),
+    "ONLY-REASONING",
+    "with no text block the model's own reasoning is still usable text",
+  );
+  assert.equal(
+    engineMod.collectText({ summary: [{ type: "text", text: "   " }], rawOutput: [{ type: "text", text: "RAW" }] }),
+    "RAW",
+    "a blank summary block falls through to rawOutput",
+  );
+  const merged = engineMod.withMergedText(real, "MERGED");
+  assert.ok(Array.isArray(merged.summary), "summary must stay an array: the host spreads it into the checkpoint");
+  assert.deepEqual(merged.summary, [{ type: "text", text: "MERGED" }], "the first text block carries the merged text");
+  assert.deepEqual(merged.rawOutput, real.rawOutput, "and every other field, rawOutput included, survives untouched");
+  assert.equal(merged.usage.inputTokens, 1);
+  const two = engineMod.withMergedText(
+    { summary: [{ type: "text", text: "first" }, { type: "reasoning", text: "kept" }] },
+    "MERGED",
+  );
+  assert.deepEqual(two.summary, [{ type: "text", text: "MERGED" }, { type: "reasoning", text: "kept" }]);
+  assert.equal(engineMod.withMergedText({ nothing: true }, "x"), undefined, "an unknown shape is never guessed");
+});
+
+testIsolated("shape: a real-shaped chunked summarize merges its parts (the chunkCalls:14 / chunkedRegions:0 regression)", async () => {
+  const { engine, agent } = engineFixture({ config: { maxSummaryChunks: 8 } });
+  const messages = [];
+  for (let index = 0; index < 30; index += 1) messages.push({ role: "user", content: "x".repeat(200000), marker: index });
+  const output = await withPatched({ summarize: realSummaryShape(baseProto.summarize) }, () =>
+    engine.summarize({ messages, model: "DeepSeek-V4.1-Flash" }, agent, undefined),
+  );
+  assert.ok(engine.calls.summarize.length >= 2, `expected chunking, got ${engine.calls.summarize.length} call(s)`);
+  assert.equal(engine.doctorStats.chunkedRegions, 1, "the region must count as chunked — zero here is the recorded defect");
+  assert.equal(engine.doctorStats.merges, 1, "and merged once");
+  const text = engineMod.collectText(output);
+  assert.equal(text.split("SUMMARY(").length - 1, engine.calls.summarize.length, "every part reaches the merge");
+  assert.ok(Array.isArray(output.summary), "the merged result keeps the host's summary-array contract");
+  assert.equal(output.blocks, undefined, "and does not invent a foreign shape");
+});
+
+testIsolated("shape: the host's own summary failures are benign, and a textless chunk degrades instead of failing", async () => {
+  // The two shapes recorded in the field are classified as benign, so neither is
+  // ever reported as a compaction error.
+  assert.equal(engineMod.isBenignSummaryFailure(new Error("summarization produced no text summary content")), true);
+  assert.equal(engineMod.isBenignSummaryFailure(new Error("summary is not smaller than the shadowed content (14756 estimated framed tokens >= 14756)")), true);
+  assert.equal(engineMod.isBenignSummaryFailure(new Error("ECONNRESET")), false);
+  assert.equal(engineMod.isBenignSummaryFailure(new engineMod.DoctorSummaryUnavailableError("summary", "x")), true);
+
+  const { session, engine, agent } = richConversation();
+  const node = session.surface.nodes[1];
+  engine.ctx._services.set("toolResultPruner", {
+    pruneSession(target) {
+      target.append("tool/result", { message: { role: "tool", content: [{ type: "text", text: "stub" }] } }, {
+        surfaceOp: { op: "replace", startSeq: node, endSeq: node },
+        sourceEventSeqs: [node],
+      });
+      return { pruned: [{ originalSeq: node }], charsRemoved: 1000 };
+    },
+  });
+  const before = session.surface.replaceGeneration;
+  const result = await withPatched(
+    {
+      // The host's own failure for a summary that carried no text.
+      summarize: async () => {
+        throw new Error("summarization produced no text summary content");
+      },
+      compactIfNeeded: async () => {
+        throw new Error("summarization produced no text summary content");
+      },
+      compactRegion: realCompactRegion,
+    },
+    () => engine.compactIfNeeded(agent, "context-overflow", undefined),
+  );
+  assert.equal(result.via, "doctor-prune", "a summary with no text descends to the prune rung");
+  assert.ok(session.surface.replaceGeneration > before, "and the surface still moves");
+  assert.ok(engine.doctorStats.benignSkips >= 1, "the skip is counted as benign");
+  assert.equal(engine.doctorStats.lastBenign.rung, "summary");
+  assert.equal(engine.doctorStats.lastFailure, undefined, "and nothing is recorded as a failure");
+  assert.equal(engine.doctorStats.lastRungFailure, undefined);
+});
+
+// --- F1: the adapter's own yardstick, with a hard margin --------------------
+
+testIsolated("F1: the chunk budget is the adapter-priced request minus maxOutput minus the hard margin", async () => {
+  const { engine, agent } = engineFixture();
+  const numbers = await engine._numbersFor(agent, engine.routeFor(agent), undefined);
+  assert.equal(numbers.W, 1048576);
+  assert.equal(numbers.summaryReserve, 65536, "the summary call carries the compaction config's own maxTokens");
+  assert.equal(numbers.summaryHardMargin, plan.SUMMARY_HARD_MARGIN_TOKENS);
+  assert.equal(
+    numbers.summaryRequestBudget,
+    Math.min(numbers.summaryBudget, numbers.W - numbers.summaryReserve - numbers.summaryHardMargin),
+    "the tighter of the shipped summary budget and the adapter ceiling wins",
+  );
+  const messages = [];
+  for (let index = 0; index < 30; index += 1) messages.push({ role: "user", content: "x".repeat(200000), marker: index });
+  await withPatched({ summarize: realSummaryShape(baseProto.summarize) }, () => engine.summarize({ messages }, agent, undefined));
+  assert.ok(engine.doctorStats.chunkRecords.length >= 2, "chunks were planned");
+  for (const record of engine.doctorStats.chunkRecords) {
+    const request = record.promptTokensEstimate + plan.SUMMARY_INSTRUCTION_TOKENS;
+    assert.ok(
+      request + numbers.summaryReserve + numbers.summaryHardMargin <= numbers.W,
+      `chunk ${record.index}: ${request} + ${numbers.summaryReserve} + ${numbers.summaryHardMargin} > ${numbers.W}`,
+    );
+  }
+});
+
+testIsolated("F1: a message larger than one chunk is split rather than sent whole (F2)", async () => {
+  const { engine, agent } = engineFixture();
+  const messages = [{ role: "user", content: [{ type: "text", text: "y".repeat(4000000) }] }, { role: "user", content: "small" }];
+  const output = await withPatched({ summarize: realSummaryShape(baseProto.summarize) }, () =>
+    engine.summarize({ messages }, agent, undefined),
+  );
+  assert.ok(engine.calls.summarize.length >= 2, `the oversized message must be cut, got ${engine.calls.summarize.length}`);
+  assert.equal(engine.doctorStats.chunkedRegions, 1);
+  assert.equal(engineMod.collectText(output).split("SUMMARY(").length - 1, engine.calls.summarize.length);
+});
+
+testIsolated("F2: a region no larger than this route's own summaries sends nothing and descends to prune", async () => {
+  const { session, engine, agent } = richConversation({ messages: 12, tokenPerNode: 40000 });
+  const node = session.surface.nodes[2];
+  const pruner = {
+    pruneSession(target) {
+      target.append("tool/result", { message: { role: "tool", content: [] } }, {
+        surfaceOp: { op: "replace", startSeq: node, endSeq: node },
+        sourceEventSeqs: [node],
+      });
+      return { pruned: [{ originalSeq: node }], charsRemoved: 1 };
+    },
+  };
+  engine.ctx._services.set("toolResultPruner", pruner);
+  // Teach the engine this route's real summary size: a 1.2 MB checkpoint is
+  // ~300k tokens, exactly the recorded `X >= X` shape where re-summarizing a
+  // region of the same size cannot possibly shrink it.
+  await withPatched(
+    { summarize: async () => ({ summary: [{ type: "text", text: "s".repeat(1200000) }], rawOutput: [], usage: undefined }) },
+    () => engine.summarize({ messages: [{ role: "user", content: "a" }, { role: "user", content: "b" }] }, agent, undefined),
+  );
+  assert.ok(engine.doctorStats.summaryCeiling > 280000, `the route's summary size is known (${engine.doctorStats.summaryCeiling})`);
+  const calls = engine.calls.summarize.length;
+  const result = await engine.compactIfNeeded(agent, "context-overflow", undefined);
+  assert.equal(engine.calls.summarize.length, calls, "a request that cannot shrink the region is never issued");
+  assert.notEqual(result, null, "the ladder still makes progress");
+  assert.equal(result.via, "doctor-prune");
+  assert.ok(session.surface.replaceGeneration > 0);
+});
+
+// --- F3: node 0 is never inside a replacement range -------------------------
+
+testIsolated("F3: the replacement never starts at the system-prompt node", async () => {
+  const { session, engine, agent } = richConversation();
+  const nodes = [...session.surface.nodes];
+  // The harness enforces the host rule, so this is the production failure.
+  assert.throws(
+    () =>
+      session.append("user/message", { role: "user", content: [{ type: "text", text: "x" }] }, {
+        surfaceOp: { op: "replace", startSeq: nodes[0], endSeq: nodes[1] },
+        sourceEventSeqs: [nodes[0], nodes[1]],
+      }),
+    /node 0 holds the system prompt/,
+  );
+  const result = await withPatched({ compactRegion: realCompactRegion }, () =>
+    engine.compactIfNeeded(agent, "context-overflow", undefined),
+  );
+  assert.notEqual(result, null);
+  const replacement = session.appends.find((event) => event.surfaceOp?.op === "replace");
+  assert.ok(replacement !== undefined, "a replacement was committed");
+  assert.notEqual(replacement.surfaceOp.startSeq, nodes[0], "node 0 must stay out of the range");
+  assert.ok(replacement.surfaceOp.startSeq >= nodes[1], "the range starts at the first non-system node");
+  assert.ok(session.surface.replaceGeneration > 0);
+});
+
+testIsolated("F3: the hard-trim rung keeps the system head and the newest node", async () => {
+  const { session, engine, agent } = richConversation({ messages: 12, tokenPerNode: 200000 });
+  const nodes = [...session.surface.nodes];
+  const result = await withPatched(flooredRungs(), () => engine.compactIfNeeded(agent, "context-overflow", undefined));
+  assert.equal(result.via, "doctor-hard-trim");
+  const replacement = session.appends.find((event) => event.surfaceOp?.op === "replace");
+  assert.notEqual(replacement.surfaceOp.startSeq, nodes[0], "the system head survives");
+  assert.equal(session.surface.nodes[0], nodes[0], "node 0 is still the system prompt");
+  assert.equal(session.surface.nodes[session.surface.nodes.length - 1], nodes[nodes.length - 1], "the newest node is kept");
+  assert.ok(session.surface.replaceGeneration > 0, "and the surface moved");
+});
+
+// --- F4: the ladder ---------------------------------------------------------
+
+testIsolated("F4 rung 2: a failed summarization descends to prune-only and still moves the surface", async () => {
+  const { session, engine, agent } = richConversation();
+  const node = session.surface.nodes[1];
+  engine.ctx._services.set("toolResultPruner", {
+    pruneSession(target) {
+      target.append("tool/result", { message: { role: "tool", content: [{ type: "text", text: "pruned" }] } }, {
+        surfaceOp: { op: "replace", startSeq: node, endSeq: node },
+        sourceEventSeqs: [node],
+      });
+      return { pruned: [{ originalSeq: node }], charsRemoved: 9000 };
+    },
+  });
+  const generation = session.surface.replaceGeneration;
+  const result = await withPatched(
+    { ...flooredRungs(), compactRegion: realCompactRegion },
+    () => engine.compactIfNeeded(agent, "context-overflow", undefined),
+  );
+  assert.equal(result.via, "doctor-prune");
+  assert.equal(engine.doctorStats.ladder.runs, 1);
+  assert.equal(engine.doctorStats.ladder.descended, 1);
+  assert.equal(engine.doctorStats.ladder.prune, 1);
+  assert.ok(session.surface.replaceGeneration > generation, "rung 2 must advance replaceGeneration");
+});
+
+testIsolated("F4 rung 3: with no prunable node the ladder hard-trims far below the window", async () => {
+  const { session, engine, agent } = richConversation({ messages: 14, tokenPerNode: 40000 });
+  const result = await withPatched(flooredRungs(), () => engine.compactIfNeeded(agent, "context-overflow", undefined));
+  assert.equal(result.via, "doctor-hard-trim");
+  assert.equal(engine.doctorStats.ladder.hardTrim, 1);
+  assert.ok(session.surface.replaceGeneration > 0);
+  const kept = session.surface.nodes.length;
+  assert.ok(kept >= 2 && kept < 16, `the trim kept ${kept} of 16 nodes`);
+  const numbers = await engine._numbersFor(agent, engine.routeFor(agent), undefined);
+  const keptTokens = (kept - 1) * 40000;
+  assert.ok(
+    keptTokens <= numbers.W * engineMod.DOCTOR_DEFAULTS.hardTrimRatio + 40000,
+    `the hard trim must land far below the window (${keptTokens} of ${numbers.W})`,
+  );
+});
+
+testIsolated("F4 exhaustion: the rungs are counted and named, and the provider's own failure stands", async () => {
+  const loud = richConversation();
+  // A session that refuses every replacement (no append at all) leaves the
+  // ladder with nothing to do: that is the only shape where it yields.
+  loud.session.append = () => {
+    throw new Error("the session refused the replacement");
+  };
+  await withPatched(flooredRungs(), async () => {
+    const result = await loud.engine.compactIfNeeded(loud.agent, "context-overflow", undefined);
+    // The accepted weak form: a named error of ours must NOT replace the
+    // provider's own failure (`dsh-llm-retry` and friends read `failure.code`).
+    assert.equal(result, null, "the exhausted ladder yields so the original failure survives");
+    assert.equal(loud.engine.doctorStats.rungFailures, 1);
+    const failure = loud.engine.doctorStats.lastRungFailure;
+    assert.equal(failure.trigger, "context-overflow");
+    assert.deepEqual(
+      failure.rungs.map((entry) => entry.split(":")[0]),
+      ["summary", "prune", "hard-trim"],
+      "every rung is named",
+    );
+    assert.equal(failure.outcomes.length, 3, "with its outcome");
+    assert.match(failure.message, /compaction-doctor/);
+    assert.ok(
+      loud.engine.ctx.logger.seen.some(([level, line]) => level === "warn" && /rung ladder exhausted/.test(line) && /summary:/.test(line)),
+      "and one warn names the rungs, in the log channel",
+    );
+  });
+
+  const quiet = richConversation();
+  quiet.session.append = () => {
+    throw new Error("the session refused the replacement");
+  };
+  await withPatched(flooredRungs(), async () => {
+    const result = await quiet.engine.compactIfNeeded(quiet.agent, "pressure", undefined);
+    assert.equal(result, null, "a pressure failure never propagates either (doc §8.13)");
+    assert.equal(quiet.engine.doctorStats.rungFailures, 1, "it is counted just the same");
+    assert.equal(quiet.engine.doctorStats.lastRungFailure.trigger, "pressure");
+  });
+});
+
+testIsolated("F4 last resort: an overflow trims even when our own measure says we are already small", async () => {
+  // The adapter refused this exact prompt, so our own estimate is under-counting.
+  // Doing nothing here is the one outcome that guarantees a dead turn, so the
+  // last rung still has to drop something.
+  const { session, engine, agent } = richConversation({ messages: 6, tokenPerNode: 1 });
+  const nodes = [...session.surface.nodes];
+  const result = await withPatched(flooredRungs(), () => engine.compactIfNeeded(agent, "context-overflow", undefined));
+  assert.equal(result.via, "doctor-hard-trim", "a refused prompt must never end in a noop");
+  assert.ok(session.surface.replaceGeneration > 0, "ADVANCE");
+  assert.notEqual(result.shadowedRange.start, nodes[0], "node 0 still stays out of the range");
+  assert.ok(result.shadowedSeqs.length >= 1, "something was actually dropped");
+  assert.ok(
+    session.surface.nodes[session.surface.nodes.length - 1] === nodes[nodes.length - 1],
+    "and the newest node is still there",
+  );
+
+  // A `pressure` trigger with nothing over target stays a noop, as it should.
+  const quiet = richConversation({ messages: 6, tokenPerNode: 1 });
+  const outcome = await withPatched(flooredRungs(), () => quiet.engine.compactIfNeeded(quiet.agent, "pressure", undefined));
+  assert.equal(outcome, null, "pressure with an empty budget is the shipped engine's own 'nothing to do'");
+  assert.equal(quiet.session.surface.replaceGeneration, 0, "and it leaves the surface alone");
+});
+
+testIsolated("F4: whenever a reducer exists, the ladder always commits a replacement", async () => {
+  // The property the ladder exists for: "the summary is unavailable" may never
+  // end in `<noop>`. With a host that accepts a replacement, some rung must
+  // always hand back a committed reduce, for every surface shape that is
+  // genuinely over the hard-trim target.
+  const shapes = [
+    { messages: 4, tokenPerNode: 400000 },
+    { messages: 10, tokenPerNode: 40000 },
+    { messages: 12, tokenPerNode: 200000 },
+    { messages: 30, tokenPerNode: 40000 },
+    { messages: 2, tokenPerNode: 500000 },
+  ];
+  for (const shape of shapes) {
+    const { session, engine, agent } = richConversation(shape);
+    const before = session.surface.replaceGeneration;
+    const result = await withPatched(flooredRungs(), () => engine.compactIfNeeded(agent, "context-overflow", undefined));
+    assert.equal(result.via, "doctor-hard-trim", `shape ${JSON.stringify(shape)} must hard-trim`);
+    assert.ok(session.surface.replaceGeneration > before, `shape ${JSON.stringify(shape)} must ADVANCE`);
+    assert.equal(engine.doctorStats.ladder.hardTrim, 1);
+  }
+
+  // And with a prunable node the second rung commits first, without a summary.
+  const pruned = richConversation({ messages: 8, tokenPerNode: 120000 });
+  const node = pruned.session.surface.nodes[1];
+  pruned.engine.ctx._services.set("toolResultPruner", {
+    pruneSession(target) {
+      target.append("tool/result", { message: { role: "tool", content: [] } }, {
+        surfaceOp: { op: "replace", startSeq: node, endSeq: node },
+        sourceEventSeqs: [node],
+      });
+      return { pruned: [{ originalSeq: node }], charsRemoved: 500 };
+    },
+  });
+  const result = await withPatched(flooredRungs(), () =>
+    pruned.engine.compactIfNeeded(pruned.agent, "context-overflow", undefined),
+  );
+  assert.equal(result.via, "doctor-prune");
+  assert.ok(pruned.session.surface.replaceGeneration > 0, "rung 2 is the cheaper path and it also advances");
+  assert.equal(pruned.engine.calls.summarize.length, 0, "and it needs no model call at all");
+});
+
+testIsolated("F4: a benign outcome advances the surface and records no error", async () => {
+  const { session, engine, agent } = richConversation({ messages: 10, tokenPerNode: 60000 });
+  const before = engine.doctorStats.benignSkips;
+  const result = await withPatched(
+    {
+      // Exactly the recorded benign shape: a summary comes back, but it is not
+      // smaller than the span it shadows.
+      summarize: async () => ({ summary: [{ type: "text", text: "z".repeat(4000) }], rawOutput: [], usage: undefined }),
+      compactRegion: realCompactRegion,
+    },
+    () => engine.compactIfNeeded(agent, "context-overflow", undefined),
+  );
+  assert.notEqual(result, null, "the ladder still makes progress");
+  assert.ok(session.surface.replaceGeneration > 0);
+  assert.ok(engine.doctorStats.benignSkips >= before, "benign skips are counted in their own counter");
+  assert.equal(engine.doctorStats.lastFailure, undefined, "a benign outcome is never recorded as a failure");
+  assert.equal(engine.doctorStats.guardFailures, 0, "and never as a shrink-guard failure");
+});
+
+testIsolated("F4: the host's own summary-recovery hook is observed and never livelocked", async () => {
+  const { engine } = richConversation();
+  assert.equal(engine.doctorStats.summaryErrorEvents, 0);
+  const verdict = await engine.ctx.emitEvent("compaction/summary-error", { error: new Error("boom"), session: {} });
+  assert.equal(verdict, false, "declining keeps the host's unbounded for(;;) loop from spinning");
+  assert.equal(engine.doctorStats.summaryErrorEvents, 1);
+});
+
+testIsolated("F4: every chunk attempt is attributed (doc §8.14)", async () => {
+  const { engine, agent } = engineFixture();
+  const messages = [];
+  for (let index = 0; index < 30; index += 1) messages.push({ role: "user", content: "x".repeat(200000), marker: index });
+  await withPatched({ summarize: realSummaryShape(baseProto.summarize) }, () => engine.summarize({ messages }, agent, undefined));
+  const record = engine.doctorStats.chunkRecords[0];
+  assert.equal(record.index, 0);
+  assert.equal(record.groups, engine.calls.summarize.length);
+  assert.equal(record.textBlocks, 1, "the real shape carries one text block per chunk");
+  assert.equal(record.reasoningBlocks, 1);
+  assert.ok(record.promptTokensEstimate > 0);
+});
+
+// --- F5: an overflow teaches a hard window upper bound ----------------------
+
+testIsolated("F5: the rejected size is written back as a hard upper bound, with a byte-exact backup", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cdoc-bounds-"));
+  const file = path.join(dir, "compaction-doctor.window-bounds.json");
+  const first = learnMod.learnRejectedWindow({ provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", rejectedTokens: 401588, declaredWindow: 1048576, file });
+  assert.equal(first.learned, true);
+  assert.equal(first.bound, 401588, "the write-back value is the rejected upper bound, exactly");
+  assert.equal(first.effectiveWindow, 401588, "and the window may never exceed it again");
+  assert.equal(first.backup, undefined, "the first write has nothing to back up");
+  const before = fs.readFileSync(file, "utf8");
+  const larger = learnMod.learnRejectedWindow({ provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", rejectedTokens: 900000, declaredWindow: 1048576, file });
+  assert.equal(larger.learned, false, "a larger rejection never raises the bound");
+  assert.equal(larger.bound, 401588);
+  assert.equal(learnMod.listBoundBackups(file).length, 0, "and an unchanged bound rewrites nothing");
+  const smaller = learnMod.learnRejectedWindow({ provider: "huaiyuan", model: "DeepSeek-V4.1-Flash", rejectedTokens: 300000, declaredWindow: 1048576, file });
+  assert.equal(smaller.bound, 300000, "a smaller rejection lowers it");
+  const backups = learnMod.listBoundBackups(file);
+  assert.equal(backups.length, 1, "the rewrite backed the previous file up first");
+  assert.equal(fs.readFileSync(backups[0].file, "utf8"), before, "and that backup is byte-exact");
+  assert.equal(learnMod.readWindowBounds(file).entries["huaiyuan/DeepSeek-V4.1-Flash"], 300000);
+  fs.writeFileSync(file, "{ this is not json", "utf8");
+  assert.deepEqual(learnMod.readWindowBounds(file).entries, {}, "a corrupt store never reads as a bound of zero");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+testIsolated("F5: a classified overflow records the bound and the engine plans against it", async () => {
+  const session = makeSession(conversationEvents());
+  const meter = makeMeter(() => measurementOf(pricedNodes(200, 233), 700000));
+  const agent = makeAgent(session);
+  const ctx = makeCtx({ llm: fakeLlm, tokenMeter: meter, sessions: { active: () => session } });
+  const engine = new engineMod.CompactionDoctorEngine(ctx, { enabled: true, scaleMode: "meter", __test: { advanceGeneration: true } });
+  await ctx.emit("agent/request-error", { agent, failure: DASHSCOPE_400, signal: undefined });
+  assert.equal(engine.doctorStats.windowLearning.rejectedTokens, 700000);
+  assert.equal(engine.doctorStats.windowLearning.bound, 700000);
+  assert.equal(engine.doctorStats.windowBound, 700000);
+  assert.equal(learnMod.readWindowBounds().entries["huaiyuan/DeepSeek-V4.1-Flash"], 700000, "and it is persisted");
+  const numbers = await engine._numbersFor(agent, engine.routeFor(agent), undefined);
+  assert.equal(numbers.W, 700000, "the declared 1 MiB window is capped by what the provider refused");
+});
+
+// --- F6: the gateway gets the repairs, the official route gets nothing ------
+
+testIsolated("F6: `declared` decides — a declared gateway is repaired, an official route is left alone", async () => {
+  const llmWithDirectory = (declared) => ({
+    ...fakeLlm,
+    listConfigurableProviders() {
+      return [{ provider: "huaiyuan", displayName: "huaiyuan", settingsNs: "llm-pi-ai", settingsPath: ["providers", "huaiyuan"], declared }];
+    },
+  });
+  const build = (llm) => {
+    const session = makeSession(conversationEvents());
+    const engine = new engineMod.CompactionDoctorEngine(
+      makeCtx({ llm, tokenMeter: makeMeter(() => measurementOf(pricedNodes(200, 233), 930386)), sessions: { active: () => session } }),
+      { enabled: true, scaleMode: "select" },
+    );
+    return { engine, agent: makeAgent(session) };
+  };
+  const messages = [];
+  for (let index = 0; index < 30; index += 1) messages.push({ role: "user", content: "x".repeat(200000) });
+
+  const gateway = build(llmWithDirectory(true));
+  assert.equal(gateway.engine.inertReason(gateway.agent), undefined, "declared: true is a third-party gateway");
+  await withPatched({ summarize: realSummaryShape(baseProto.summarize) }, () => gateway.engine.summarize({ messages }, gateway.agent, undefined));
+  assert.equal(gateway.engine.doctorStats.chunkedRegions, 1, "a declared provider gets the full repair");
+
+  const official = build(llmWithDirectory(false));
+  assert.match(official.engine.inertReason(official.agent), /official route/, "declared: false means the shipped catalog owns the route");
+  const output = await withPatched({ summarize: realSummaryShape(baseProto.summarize) }, () =>
+    official.engine.summarize({ messages }, official.agent, undefined),
+  );
+  assert.equal(official.engine.doctorStats.chunkedRegions, 0, "and nothing is chunked for it");
+  assert.equal(official.engine.calls.summarize.length, 1, "the region goes out exactly as the shipped engine would send it");
+  assert.equal(official.engine.calls.summarize[0].count, 30);
+  assert.deepEqual(output.summary, [{ type: "text", text: "SUMMARY(30)" }]);
+});
+
+testIsolated("F6: the switch off and scaleMode off leave every override inert, including summarize", async () => {
+  const messages = [];
+  for (let index = 0; index < 30; index += 1) messages.push({ role: "user", content: "x".repeat(200000) });
+  for (const config of [{ enabled: false, scaleMode: "meter" }, { enabled: true, scaleMode: "off" }]) {
+    const session = makeSession(conversationEvents());
+    const engine = new engineMod.CompactionDoctorEngine(
+      makeCtx({ llm: fakeLlm, tokenMeter: makeMeter(() => measurementOf(pricedNodes(200, 233), 930386)), sessions: { active: () => session } }),
+      config,
+    );
+    const agent = makeAgent(session);
+    assert.ok(typeof engine.inertReason(agent) === "string", `${JSON.stringify(config)} must stand the engine down`);
+    const output = await withPatched({ summarize: realSummaryShape(baseProto.summarize) }, () => engine.summarize({ messages }, agent, undefined));
+    assert.equal(engine.doctorStats.chunkedRegions, 0, "no chunking happens while the engine is inert");
+    assert.equal(engine.calls.summarize.length, 1, "the summary goes out exactly once, as the host built it");
+    assert.deepEqual(output.summary, [{ type: "text", text: "SUMMARY(30)" }]);
+    const compacted = await engine.compactIfNeeded(agent, "context-overflow", undefined);
+    assert.equal(compacted.via, "base", "and compactIfNeeded is the shipped one");
+    assert.equal(engine.doctorStats.selectRuns, 0);
+    assert.equal(engine.doctorStats.ladder.runs, 0, "no ladder runs at all");
   }
 });
 

@@ -3,6 +3,7 @@
 
 # the harness regenerates this from lib/ on every run
 test/nm/lib/
+test/replay/lib/
 
 *.log
 *.bak

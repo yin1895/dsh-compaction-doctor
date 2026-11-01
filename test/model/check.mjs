@@ -147,6 +147,8 @@ function buildSandboxTree() {
       "export * as engine from './lib/engine.js';",
       "export * as engineDefaultsOn from './lib/engine.defaults-on.js';",
       "export * as status from './lib/status.js';",
+      "export * as llm from '@deepseek-ai/dsh-llm';",
+      "export * as basic from '@deepseek-ai/dsh-compaction-basic';",
       "",
     ].join("\n"),
     "utf8",
@@ -1684,6 +1686,7 @@ await invariant("I11d", "doctorConfig().layer()：probe 行的「无意见」不
 //
 // 原则：站点集合、来源数、判定、分类全部在运行期从**当前源码**与**真实对象**推出，
 // 不写死任何行号或期望。所以以后每修一处合并点，这里不会 FAIL。
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 const BRACKETS = { "{": "}", "(": ")", "[": "]" };
@@ -2069,6 +2072,702 @@ await invariant("I11e", "全仓合并点审计（站点集合运行期现取）�
   if (passCount === 0) skip(`全部 ${skipCount} 个多来源站点都无法驱动，没有可判定的合并点`);
   return `${sites.length} 个站点（现取）：PASS ${passCount}、SKIP ${skipCount}、FAIL 0 —— 显式格并 ${explicitJoinCount}、单来源 ${singleSourceCount}、多来源展开/赋值 ${multiSourceSpreadCount}（其中键集不相交 ${multiSourceSpreadCount - multiSourceSkipped}、SKIP ${multiSourceSkipped}）`;
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §5c I12：进度（溢出分类的终态纪律）—— 规格 §9
+//
+// 真实对象：`lib/engine.js` 的 `CompactionDoctorEngine` + 真实 `lib/overflow.js`
+// 判定函数 + 真实 cordis waterfall。宿主边界（llm / sessions / tokenMeter / surface）
+// 由检验器接管，故障只在**边界**注入，不桩替换阶梯内部。
+// ─────────────────────────────────────────────────────────────────────────────
+
+const INJECTION_ALPHABET = ["none", "summarize-throw", "replace-reject", "adapter-overflow"];
+const OVERFLOW_TEXT = 'pi-ai detected context overflow for model "DeepSeek-V4.1-Flash"';
+const NODE0_TEXT =
+  "surface replace: node 0 holds the system prompt and may be rewritten only by a system/message over exactly that node";
+const BENIGN_OVERFLOW_FAILURE = {
+  code: "invalid_request_error",
+  message: "This model's maximum context length is 428917 tokens, however you requested 1002590 tokens",
+};
+
+const WRITE_OP = /replace|prune|drop|truncate|set|write|mutate|commit|flush|append|push|remove|delete|clear|splice/iu;
+const READ_OP = /^(get|read|list|has|measure|count|length|size|hasOwnProperty|then|toJSON|valueOf|toString)/u;
+
+let RIG_SEQ = 0;
+
+/**
+ * 真实引擎 + 受控宿主边界。
+ *  - `boundary.surfaceOps` / `boundary.llmOps`：边界被触碰的次数（= 前进尝试序号的来源）
+ *  - `boundary.policy[i]`：第 i 次"前进尝试"的注入
+ *  - 注入模型（唯一一处对宿主行为的建模，规格 §9.6 已声明）：一次**成功的写操作**使
+ *    `replaceGeneration` 前移；读操作不使之前移。名字判定见 WRITE_OP / READ_OP。
+ */
+async function makeOverflowRig(options = {}) {
+  const {
+    maxOverflowRetries = 2,
+    generationBehavior = "surface",
+    overflowRecovery = true,
+    policy = [],
+    withDoctor = true,
+    withEngine = true,
+    rich = false,
+  } = options;
+  RIG_SEQ += 1;
+  useHome(`i12-rig-${RIG_SEQ}`);
+  const boundary = { surfaceOps: 0, llmOps: 0, policy, logs: [] };
+  let generation = 7;
+
+  const faultAt = (ordinal) => policy[Math.min(ordinal, policy.length - 1)] ?? "none";
+
+  const surface = new Proxy(
+    {},
+    {
+      get(_target, key) {
+        if (key === "replaceGeneration") {
+          if (generationBehavior === "advancing") return (generation += 1);
+          return generation;
+        }
+        if (typeof key !== "string") return undefined;
+        return () => {
+          const ordinal = boundary.surfaceOps;
+          boundary.surfaceOps += 1;
+          const mode = faultAt(ordinal);
+          if (mode === "replace-reject") throw new Error(NODE0_TEXT);
+          if (mode === "adapter-overflow") throw new Error(OVERFLOW_TEXT);
+          if (mode === "summarize-throw") throw new Error("injected boundary failure");
+          // 成功的一次写操作 ⇒ surface 真的换掉了
+          if (READ_OP.test(key) !== true && WRITE_OP.test(key) === true) generation += 1;
+          return undefined;
+        };
+      },
+    },
+  );
+
+  // 宽容会话桩：已知数据键走真值，其它任何方法名都返回 async no-op。
+  // 依据：shipped 基类监听器会调用 `session.requestHeader()` 等宿主方法（控制组实测），
+  // 缺一个就永远到不了插件的分类器。这里只补齐**宿主契约的表面**，不改任何转移逻辑。
+  const RICH_EVENTS = [
+    { seq: 1, type: "system/message", text: "system prompt" },
+    { seq: 2, type: "user/message", text: "hello" },
+    { seq: 3, type: "assistant/message", text: "hi" },
+    { seq: 4, type: "tool/result", text: "ok", toolCallId: "t1" },
+    { seq: 5, type: "user/message", text: "again" },
+  ];
+  const sessionTarget = {
+    id: "s-model-test",
+    surface,
+    messages: [],
+    events: rich === true ? RICH_EVENTS : [],
+    meta: {},
+  };
+  const session = new Proxy(sessionTarget, {
+    get(target, key) {
+      if (typeof key !== "string") return Reflect.get(target, key);
+      if (key in target) return Reflect.get(target, key);
+      return async () => ({});
+    },
+  });
+  const agent = new Proxy(
+    { session },
+    {
+      get(target, key) {
+        if (typeof key === "string" && key in target) return Reflect.get(target, key);
+        if (typeof key === "string") return async () => ({});
+        return Reflect.get(target, key);
+      },
+    },
+  );
+
+  const llm = new Proxy(
+    {},
+    {
+      get(_target, key) {
+        if (typeof key !== "string") return undefined;
+        return () => {
+          const ordinal = boundary.llmOps;
+          boundary.llmOps += 1;
+          const mode = faultAt(ordinal);
+          if (mode === "summarize-throw") throw new Error("summarize failed: injected");
+          if (mode === "adapter-overflow") throw new Error(OVERFLOW_TEXT);
+          if (rich === true && /info|route|number|window|limit|model/iu.test(key) === true) {
+            // 丰宿主桩：给一句"看起来像真的"的模型信息，让降级链路能走到边界
+            return {
+              contextWindow: 200000,
+              maxOutput: 65536,
+              maxOutputTokens: 65536,
+              maxTokens: 65536,
+              outputTokens: 65536,
+              reserveTokens: 65536,
+              provider: "model-test",
+              model: "model-test",
+              providerEntryId: "p",
+              engineEntryId: "e",
+            };
+          }
+          return undefined;
+        };
+      },
+    },
+  );
+
+  const sessions = new Proxy(
+    {},
+    {
+      get(_target, key) {
+        if (typeof key !== "string") return undefined;
+        return () => undefined;
+      },
+    },
+  );
+
+  const RICH_NODES = [1, 2, 3, 4].map((i) => ({ seq: i, tokens: 40000, kind: i === 1 ? "system" : "message" }));
+  const tokenMeter = new Proxy(
+    {},
+    {
+      get(_target, key) {
+        if (typeof key !== "string") return undefined;
+        return () => {
+          if (rich === true && /measure/iu.test(key) === true) {
+            return {
+              nodes: RICH_NODES,
+              totalTokens: 160000,
+              surfaceTokens: 160000,
+              heuristicTokens: 160000,
+              modelTokens: 160000,
+              limit: 200000,
+            };
+          }
+          return { nodes: [], tokens: 0, totalTokens: 0, surfaceTokens: 0, heuristicTokens: 0 };
+        };
+      },
+    },
+  );
+
+  const host = await makeHostRoot();
+  host.provide("llm", llm);
+  host.provide("sessions", sessions);
+  host.provide("tokenMeter", tokenMeter);
+  if (rich === true) {
+    // 丰宿主桩：rung 2 只在"没有 toolResultPruner 服务"时才 unavailable。给它一个会真的
+    // 报告 pruned 条目的桩（并让它的调用同样受注入策略控制），阶梯就能在第 2 级 commit。
+    host.provide("toolResultPruner", {
+      pruneSession: () => {
+        const ordinal = boundary.surfaceOps;
+        boundary.surfaceOps += 1;
+        const mode = faultAt(ordinal);
+        if (mode === "replace-reject") throw new Error(NODE0_TEXT);
+        if (mode === "adapter-overflow") throw new Error(OVERFLOW_TEXT);
+        if (mode === "summarize-throw") throw new Error("injected boundary failure");
+        generation += 1; // 真的把表面换掉了
+        return { pruned: [{ originalSeq: 2, charsRemoved: 120 }], charsRemoved: 120 };
+      },
+    });
+  }
+  const ENGINE_ROW = {
+    auto: true,
+    thresholdRatio: 0.8,
+    headroomTokens: 65536,
+    retainRatio: 0.05,
+    maxTokens: 65536,
+    compactionRetries: 2,
+    maxOverflowRetries,
+  };
+  // 控制组（withEngine=false）：只有 shipped 基类的监听器，用来判定"插件的分类器是否真被到达"
+  let doctor = null;
+  let engine = null;
+  if (withDoctor) {
+    doctor = new M.probe.CompactionDoctor(host.root, { enabled: true, overflowRecovery });
+    if (!REAL_CORDIS) host.provide("compactionDoctor", doctor);
+  }
+  if (withEngine) {
+    engine = new M.engine.CompactionDoctorEngine(host.root, ENGINE_ROW);
+  } else {
+    const Base = M.basic?.BasicCompactionEngine;
+    if (typeof Base !== "function") throw new Error("拿不到 shipped BasicCompactionEngine（控制组无法建立）");
+    engine = new Base(host.root, ENGINE_ROW);
+  }
+  const stats = withEngine
+    ? engine.doctorStats
+    : { classifications: 0, classificationRetries: 0 }; // 控制组没有插件统计，只用于比较抛出/next 行为
+
+  // 记录插件的告警（`lib/util.js` 的 logLine 走 ctx.logger，退化为 console）——
+  // 这是"前进尝试 = 0"的**可复现理由**的来源。只做观测，不改动任何 lib 代码。
+  const captureLogs = () => {
+    const logs = [];
+    const prevWarn = console.warn;
+    const prevError = console.error;
+    const push = (...args) => {
+      logs.push(args.map((a) => (typeof a === "string" ? a : String(a?.message ?? a))).join(" "));
+    };
+    console.warn = push;
+    console.error = push;
+    let restoreLogger = null;
+    try {
+      const logger = host.root.logger;
+      if (logger !== undefined && logger !== null && typeof logger.warn === "function") {
+        const own = logger.warn;
+        logger.warn = push;
+        restoreLogger = () => {
+          logger.warn = own;
+        };
+      }
+    } catch {
+      /* 没有可封装的 logger */
+    }
+    return {
+      logs,
+      stop: () => {
+        console.warn = prevWarn;
+        console.error = prevError;
+        if (restoreLogger !== null) restoreLogger();
+      },
+    };
+  };
+
+  const emit = (name, ...args) => {
+    if (typeof host.root.waterfall === "function") return host.root.waterfall(name, ...args);
+    if (host.root.events !== undefined && typeof host.root.events.waterfall === "function") {
+      return host.root.events.waterfall(name, ...args);
+    }
+    throw new Error("真实 cordis 上找不到 waterfall（无法驱动 agent/request-error）");
+  };
+
+  /** 一次分类器调用；返回终态观测。 */
+  const drive = async (overrides = {}) => {
+    const before = { c: stats.classifications, r: stats.classificationRetries };
+    const opsBefore = boundary.surfaceOps + boundary.llmOps;
+    let nextCalls = 0;
+    const sentinel = { kind: "@propagated-original-failure" };
+    const next = () => {
+      nextCalls += 1;
+      return sentinel;
+    };
+    const payload = { agent, signal: "signal" in overrides ? overrides.signal : { aborted: false } };
+    if ("failure" in overrides) {
+      if (overrides.failure !== undefined) payload.failure = overrides.failure;
+    } else {
+      payload.failure = BENIGN_OVERFLOW_FAILURE;
+    }
+    if ("agent" in overrides) payload.agent = overrides.agent;
+    let result;
+    let thrown;
+    const tap = captureLogs();
+    try {
+      result = await emit("agent/request-error", payload, next);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      tap.stop();
+      for (const line of tap.logs) boundary.logs.push(line);
+    }
+    const dC = stats.classifications - before.c;
+    const dR = stats.classificationRetries - before.r;
+    const terminal =
+      thrown !== undefined
+        ? "REPORT"
+        : result === sentinel
+          ? dC > 0
+            ? "PROPAGATE"
+            : "DECLINE"
+          : result !== undefined && typeof result === "object" && result.kind === "retry"
+            ? "ADVANCE"
+            : "OTHER";
+    return {
+      terminal,
+      result,
+      thrown,
+      nextCalls,
+      dC,
+      dR,
+      boundaryOps: boundary.surfaceOps + boundary.llmOps - opsBefore,
+      generation,
+      sentinel,
+      hasStats: withEngine,
+    };
+  };
+
+  return { host, doctor, engine, agent, session, surface, boundary, drive, generationOf: () => generation };
+}
+
+const isNamedByPlugin = (error) => {
+  const text = `${error?.message ?? ""}\n${error?.stack ?? ""}`;
+  return /compaction[- _]?doctor/iu.test(text) || text.includes("@local/");
+};
+
+await invariant("I12a", "不许假前进：分类/前进/next() 三者的纪律（真实分类器上的穷尽前置条件网格）", async (ctx) => {
+  const failureKinds = {
+    absent: undefined,
+    null: null,
+    nonOverflow: { code: "invalid_request_error", message: "rate limit exceeded" },
+    overflowPattern: BENIGN_OVERFLOW_FAILURE,
+    branded: { code: M.llm?.CONTEXT_WINDOW_EXCEEDED_CODE ?? "context_window_exceeded", message: "branded" },
+  };
+  const signalKinds = { none: undefined, live: { aborted: false }, aborted: { aborted: true } };
+  const agentKinds = { noSession: {}, withSession: null };
+
+  let drives = 0;
+  let classified = 0;
+  let advanced = 0;
+  let propagatedAfterClassify = 0;
+  let historicalShape = 0;
+  let historicalWitness = null;
+  let outOfScope = 0;
+  const outOfScopeReasons = new Map();
+  const violations = [];
+
+  // 控制组：只有 shipped 基类的监听器。用来判定"插件的分类器是否真的被这条链到达"——
+  // 若带插件的驱动与控制组在"抛出/next"上完全一致且什么都没分类，说明分类器根本没跑到，
+  // 该网格点超出 I12 的适用范围（属于更外层监听器的行为），实测记录、不作为违反。
+  const controlCache = new Map();
+  const controlFor = async (failureName, failure, signalName, signal, agentName) => {
+    const key = `${failureName}|${signalName}|${agentName}`;
+    if (controlCache.has(key)) return controlCache.get(key);
+    const rig = await makeOverflowRig({ withDoctor: false, withEngine: false });
+    const overrides = { failure, signal };
+    if (agentName === "withSession") overrides.agent = rig.agent;
+    else if (agentName === "noSession") overrides.agent = {};
+    const out = await rig.drive(overrides);
+    controlCache.set(key, out);
+    return out;
+  };
+
+  for (const overflowRecovery of [true, false]) {
+    for (const [failureName, failure] of Object.entries(failureKinds)) {
+      for (const [signalName, signal] of Object.entries(signalKinds)) {
+        for (const [agentName, agentOverride] of Object.entries(agentKinds)) {
+          const control = await controlFor(failureName, failure, signalName, signal, agentName);
+          for (const generationBehavior of ["stable", "advancing"]) {
+            const rig = await makeOverflowRig({ overflowRecovery, generationBehavior });
+            const label = `overflowRecovery=${String(overflowRecovery)} failure=${failureName} signal=${signalName} agent=${agentName} generation=${generationBehavior}`;
+            const overrides = { failure, signal };
+            if (agentOverride === null) overrides.agent = rig.agent;
+            else if (agentOverride !== undefined) overrides.agent = agentOverride;
+            const out = await rig.drive(overrides);
+            drives += 1;
+
+            // 该点是否落在 I12 的适用范围内
+            const sameAsControl =
+              out.nextCalls === control.nextCalls &&
+              String(out.thrown?.message ?? "") === String(control.thrown?.message ?? "");
+            const inScope = out.dC > 0 || out.dR > 0 || sameAsControl !== true || control.nextCalls > 0;
+            if (inScope !== true) {
+              outOfScope += 1;
+              const reason = `${failureName}/${signalName}/${agentName}: 分类器未被到达（更外层监听器先抛出「${String(control.thrown?.message ?? "").slice(0, 80)}」）`;
+              outOfScopeReasons.set(reason.split(":")[0], reason);
+              // 超出范围也要断言最弱的一条：失败绝不被静默吞掉
+              if (out.nextCalls === 0 && out.thrown === undefined) {
+                violations.push(`${label}: 失败被静默吞掉（既没 next() 也没抛错）`);
+              }
+              continue;
+            }
+
+            // (D5) waterfall 次数纪律
+            if (out.nextCalls > 1) violations.push(`${label}: next() 被调用了 ${out.nextCalls} 次`);
+            // (D1) 终态必须是四元字母表之一
+            if (out.terminal === "OTHER") violations.push(`${label}: 终态既不是 ADVANCE/REPORT/DECLINE/PROPAGATE（result=${JSON.stringify(out.result)}）`);
+            // (D4) 单调：没分类就不可能有前进计数
+            if (out.dC === 0 && out.dR !== 0) violations.push(`${label}: 没分类却增加了前进计数`);
+            if (out.dC > 1 || out.dR > 1) violations.push(`${label}: 单次调用的计数增量 > 1`);
+            if (out.dR > 0) {
+              advanced += 1;
+              // (D2) 前进 ⇒ 生成代真的前移
+              if (out.generation <= 7) violations.push(`${label}: 计为前进但 replaceGeneration 未前移（${out.generation}）`);
+              if (out.dC !== 1) violations.push(`${label}: 计为前进但 classifications 没 +1`);
+              if (out.result?.kind !== "retry") violations.push(`${label}: 计为前进但没返回 {kind:"retry"}`);
+            }
+            if (out.dC === 1) {
+              classified += 1;
+              // (D3 弱形式) 分类了却没前进 ⇒ 必须调用 next()，不许吞掉失败
+              if (out.dR === 0) {
+                propagatedAfterClassify += 1;
+                if (out.nextCalls !== 1) {
+                  violations.push(`${label}: 分类后既没前进也没把原始失败交给 next()（nextCalls=${out.nextCalls}）`);
+                }
+                // 历史形状 = 分类了 ∧ 没前进 ∧ 没被取消 ∧ 预算还有，却把**原始失败**放行
+                if (signal?.aborted !== true && out.terminal === "PROPAGATE") {
+                  historicalShape += 1;
+                  historicalWitness ??= label;
+                }
+              }
+            } else if (out.nextCalls !== 1) {
+              violations.push(
+                `${label}: 没分类却没调用 next()（nextCalls=${out.nextCalls}, terminal=${out.terminal}, thrown=${String(out.thrown?.message ?? out.thrown).slice(0, 200)}, result=${JSON.stringify(out.result)?.slice(0, 140)}）`,
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+  for (const reason of outOfScopeReasons.values()) console.log(`    （超出范围，实测记录）${reason}`);
+
+  // 预算纪律：(D4) 前进计数 ≤ maxOverflowRetries，且耗尽后不再分类
+  const budgetFacts = [];
+  for (const maxOverflowRetries of [0, 2]) {
+    const rig = await makeOverflowRig({ maxOverflowRetries, generationBehavior: "advancing" });
+    for (let i = 0; i < maxOverflowRetries + 3; i += 1) await rig.drive({ failure: BENIGN_OVERFLOW_FAILURE });
+    const c = rig.engine.doctorStats.classifications;
+    const r = rig.engine.doctorStats.classificationRetries;
+    if (r > maxOverflowRetries) violations.push(`maxOverflowRetries=${maxOverflowRetries}: 前进计数 ${r} 超过预算`);
+    if (c !== maxOverflowRetries) violations.push(`maxOverflowRetries=${maxOverflowRetries}: classifications=${c}，预期恰好 ${maxOverflowRetries}（预算耗尽后不该再分类）`);
+    if (r !== maxOverflowRetries) violations.push(`maxOverflowRetries=${maxOverflowRetries}: classificationRetries=${r}，预期 ${maxOverflowRetries}`);
+    budgetFacts.push(`max=${maxOverflowRetries} ⇒ classifications=${c}, retries=${r}`);
+  }
+
+  if (violations.length > 0) {
+    ctx.counterexamples.push(violations[0]);
+    fail(`I12a 违反 ${violations.length} 处：\n           ${violations.slice(0, 6).join("\n           ")}`);
+  }
+
+  console.log(`  I12a 驱动 ${drives} 次（真实分类器）+ 预算回放 2 组`);
+  console.log(`    (D2) 前进分支 ${advanced} 次，全部满足「计为前进 ⇒ 生成代前移 ∧ classifications+1 ∧ 返回 {kind:"retry"}」`);
+  console.log(`    (D3 弱形式) 分类后未前进 ${propagatedAfterClassify} 次，全部调用 next() 恰好 1 次（原始失败未被吞掉）`);
+  console.log(`    (D4) 预算：${budgetFacts.join("；")}`);
+  console.log(`    (D5) next() 每次调用 ≤ 1 次：全部满足`);
+  console.log(`    历史形状（分类 ∧ 未前进 ∧ 未取消 ∧ 预算有 ⇒ 放行原始失败）实测 ${historicalShape} 个组合${historicalWitness === null ? "" : `，如 ${historicalWitness}`}`);
+  return `${drives} 次驱动 + 2 组预算回放：(D2)(D4)(D5) 零违反；分类 ${classified} 次、前进 ${advanced} 次、分类后未前进 ${propagatedAfterClassify} 次（全部按 (D3) 弱形式交给 next()）；历史形状实测 ${historicalShape} 个组合（(D3) 强形式由 I12c 判定）`;
+});
+
+const LADDER_FIELDS = ["runs", "descended", "summary", "prune", "hardTrim"];
+
+/** 从真实 `doctorStats` 读阶梯状态（运行期发现级数，不写死级数）。 */
+const ladderSnapshot = (engine) => {
+  const stats = engine?.doctorStats ?? {};
+  const ladder = stats.ladder ?? {};
+  const out = { rungFailures: Number.isFinite(stats.rungFailures) ? stats.rungFailures : 0, lastRungFailure: stats.lastRungFailure?.message };
+  for (const field of LADDER_FIELDS) out[field] = Number.isFinite(ladder[field]) ? ladder[field] : 0;
+  return out;
+};
+
+const NAMED_RE = /compaction[- _]?doctor|@local\//iu;
+const FAILURE_RE = /failed|noop|unavailable|aborted|skipped|rung|exhaust|declined/iu;
+const RUNG_RE = /(?:^|[;\s（(])([a-z][\w-]{1,24}): (committed|failed|noop|unavailable|aborted|skipped)\b/gu;
+
+/**
+ * 运行期发现降级级数：从**实现自己输出的**合成错误文本里枚举级名。
+ * 不写死"3 级"，也不依赖任何私有字段——只有被实际尝试过的级才会出现在文本里。
+ */
+const rungsFromLogs = (logs) => {
+  const found = new Map();
+  for (const line of logs) {
+    RUNG_RE.lastIndex = 0;
+    let match;
+    while ((match = RUNG_RE.exec(String(line))) !== null) {
+      if (found.has(match[1]) !== true) found.set(match[1], match[2]);
+    }
+  }
+  return found;
+};
+
+await invariant("I12b", "阶梯结构与点名义务：级数运行期发现，每级失败必须在 stats/日志里点名（真实 lib/engine.js）", async (ctx) => {
+  const K = 3;
+  const policies = [];
+  const build = (prefix) => {
+    if (prefix.length === K) {
+      policies.push([...prefix]);
+      return;
+    }
+    for (const injection of INJECTION_ALPHABET) build([...prefix, injection]);
+  };
+  build([]);
+
+  let combos = 0;
+  let rungsMax = 0;
+  let advanced = 0;
+  let declined = 0;
+  let propagated = 0;
+  let reported = 0;
+  let namedOk = 0;
+  let boundaryOpsMax = 0;
+  const rungsSeen = new Set();
+  const weakViolations = [];
+  const strongMiss = [];
+  const bailReasons = new Map();
+  const witnesses = new Map();
+
+  for (const policy of policies) {
+    const rig = await makeOverflowRig({ policy, generationBehavior: "surface" });
+    const before = ladderSnapshot(rig.engine);
+    const out = await rig.drive({ failure: BENIGN_OVERFLOW_FAILURE, signal: { aborted: false } });
+    const after = ladderSnapshot(rig.engine);
+    combos += 1;
+    boundaryOpsMax = Math.max(boundaryOpsMax, out.boundaryOps);
+
+    const runs = after.runs - before.runs;
+    const descended = after.descended - before.descended;
+    const rungFailures = after.rungFailures - before.rungFailures;
+    const rungNames = rungsFromLogs(rig.boundary.logs);
+    for (const name of rungNames.keys()) rungsSeen.add(name);
+    rungsMax = Math.max(rungsMax, rungNames.size > 0 ? rungNames.size : runs === 0 ? 0 : 1 + descended);
+
+    const namedInStats =
+      rungFailures > 0 && typeof after.lastRungFailure === "string" && after.lastRungFailure.length > 0 && NAMED_RE.test(after.lastRungFailure);
+    const namedInLogs = rig.boundary.logs.some((line) => NAMED_RE.test(line) && FAILURE_RE.test(line));
+    const named = namedInStats || namedInLogs;
+    if (named === true) namedOk += 1;
+
+    if (out.terminal === "ADVANCE") {
+      advanced += 1;
+      if (out.dR !== 1) weakViolations.push(`${policy.join(",")}: 终态 ADVANCE 但前进计数增量 = ${out.dR}`);
+      if (out.generation <= 7) weakViolations.push(`${policy.join(",")}: 终态 ADVANCE 但 replaceGeneration 未前移`);
+    } else if (out.terminal === "DECLINE") {
+      declined += 1;
+    } else if (out.terminal === "REPORT") {
+      reported += 1;
+      if (isNamedByPlugin(out.thrown) !== true) weakViolations.push(`${policy.join(",")}: 抛错但没点名本插件（${String(out.thrown?.message ?? "").slice(0, 90)}）`);
+    } else if (out.terminal === "PROPAGATE") {
+      propagated += 1;
+      // (D3 弱形式，当前绑定的义务)：分类了却没前进 ⇒ 必须放行原始失败 ∧ 在 stats/日志里点名本插件
+      if (out.dC !== 1) weakViolations.push(`${policy.join(",")}: PROPAGATE 但 classifications 增量 = ${out.dC}`);
+      if (out.nextCalls !== 1) weakViolations.push(`${policy.join(",")}: PROPAGATE 但 next() 调用 ${out.nextCalls} 次`);
+      if (named !== true) weakViolations.push(`${policy.join(",")}: 分类了却没前进，且没有任何点名本插件的失败记录（静默放行）`);
+      // (D3 强形式，未绑定)：终结错误是否就是阶梯的点名错误
+      strongMiss.push(policy.join(","));
+      if (witnesses.has("strong") !== true) witnesses.set("strong", policy.join(","));
+    } else {
+      weakViolations.push(`${policy.join(",")}: 终态 ${out.terminal}（不属于四元字母表）`);
+    }
+
+    for (const line of rig.boundary.logs) {
+      if (FAILURE_RE.test(line) !== true) continue;
+      const key = String(line).replace(/\d+/gu, "#").slice(0, 220);
+      if (bailReasons.has(key) !== true) bailReasons.set(key, String(line).replace(/\d+/gu, "#").slice(0, 220));
+    }
+  }
+
+  console.log(`  I12b 边界注入组合 ${combos} 个（Σ_inj^${K}，Σ_inj = ${INJECTION_ALPHABET.join("/")}）；本桩下阶梯都在触碰注入点前退出（有效注入见 I12c 的富桩）`);
+  console.log(`    运行期发现的阶梯级名（从实现自己输出的合成错误里枚举）：${[...rungsSeen].join(" → ") || "（无）"}（共 ${rungsMax} 级；不写死级数）`);
+  console.log(`    终态分布：ADVANCE ${advanced}、PROPAGATE ${propagated}、DECLINE ${declined}、REPORT ${reported}`);
+  console.log(`    点名可观测（stats.lastRungFailure 或告警文本里含插件标识）：${namedOk}/${combos}`);
+  for (const line of [...bailReasons.values()].slice(0, 3)) console.log(`    降级链路实测：${line}`);
+
+  if (weakViolations.length > 0) {
+    ctx.counterexamples.push(weakViolations[0]);
+    fail(`I12b（弱形式）违反 ${weakViolations.length} 处：\n           ${weakViolations.slice(0, 5).join("\n           ")}`);
+  }
+  if (strongMiss.length > 0) {
+    console.log(
+      `    (D3 强形式) ${strongMiss.length}/${combos} 个组合的回合终结错误是原始失败而非阶梯的点名错误 —— 详见 I12c 的告警（那里的边界注入真的生效）`,
+    );
+  }
+  return (
+    `${combos} 个注入组合：阶梯级数 ${rungsMax}（运行期发现）、前进 ${advanced}、放行原始失败但已点名 ${propagated}、` +
+    `未分类 ${declined}、抛错 ${reported}；点名可观测 ${namedOk}/${combos}；(D3 弱形式) 零违反` +
+    (strongMiss.length > 0 ? `；(D3 强形式) ${strongMiss.length}/${combos} 未满足 → 见告警` : "")
+  );
+});
+
+await invariant("I12c", "逐级注入：三级降级各自失败/成功的全部组合，终态纪律与点名义务（真实 lib/engine.js）", async (ctx) => {
+  // 富宿主桩让 rung 2 真的能提交（`toolResultPruner` 报告 pruned 条目 ⇒ 表面真的换掉），
+  // 于是"某一级成功/失败"成为可注入的分支：策略向量的第 i 位就是第 i 次前进尝试的注入。
+  const policies = [];
+  const build = (prefix) => {
+    if (prefix.length === 3) {
+      policies.push([...prefix]);
+      return;
+    }
+    for (const injection of INJECTION_ALPHABET) build([...prefix, injection]);
+  };
+  build([]);
+
+  const terminals = new Map();
+  const violations = [];
+  let touched = 0;
+  let advanced = 0;
+  let propagated = 0;
+  let namedOk = 0;
+  let strongMiss = 0;
+  let witness = null;
+  const rungSeen = new Map();
+  const rungCommitted = { summary: 0, prune: 0, hardTrim: 0 };
+  let ladderRuns = 0;
+  let ladderDescended = 0;
+  const bailReasons = new Map();
+
+  for (const policy of policies) {
+    const rig = await makeOverflowRig({ policy, rich: true, generationBehavior: "surface" });
+    const before = ladderSnapshot(rig.engine);
+    const out = await rig.drive({ failure: BENIGN_OVERFLOW_FAILURE, signal: { aborted: false } });
+    const after = ladderSnapshot(rig.engine);
+    const label = `注入 ${policy.join(",")}`;
+
+    if (out.boundaryOps > 0) touched += 1;
+    terminals.set(out.terminal, (terminals.get(out.terminal) ?? 0) + 1);
+
+    const descended = after.descended - before.descended;
+    const rungFailures = after.rungFailures - before.rungFailures;
+    if (after.runs - before.runs > 0) ladderRuns += 1;
+    if (descended > 0) ladderDescended += 1;
+    rungCommitted.summary += after.summary - before.summary;
+    rungCommitted.prune += after.prune - before.prune;
+    rungCommitted.hardTrim += after.hardTrim - before.hardTrim;
+    for (const [name, outcome] of rungsFromLogs(rig.boundary.logs)) {
+      if (rungSeen.has(name) !== true) rungSeen.set(name, new Map());
+      const byOutcome = rungSeen.get(name);
+      byOutcome.set(outcome, (byOutcome.get(outcome) ?? 0) + 1);
+    }
+
+    const namedInStats =
+      rungFailures > 0 && typeof after.lastRungFailure === "string" && NAMED_RE.test(after.lastRungFailure);
+    const namedInLogs = rig.boundary.logs.some((line) => NAMED_RE.test(line) && FAILURE_RE.test(line));
+    if (namedInStats === true || namedInLogs === true) namedOk += 1;
+
+    if (out.terminal === "ADVANCE") {
+      advanced += 1;
+      if (out.dR !== 1) violations.push(`${label}: ADVANCE 但前进计数增量 = ${out.dR}`);
+      if (out.generation <= 7) violations.push(`${label}: ADVANCE 但 replaceGeneration 未前移`);
+      if (out.result?.kind !== "retry") violations.push(`${label}: ADVANCE 但没返回 {kind:"retry"}`);
+    } else if (out.terminal === "PROPAGATE") {
+      propagated += 1;
+      if (out.dC !== 1) violations.push(`${label}: PROPAGATE 但 classifications 增量 = ${out.dC}`);
+      if (out.nextCalls !== 1) violations.push(`${label}: PROPAGATE 但 next() 调用 ${out.nextCalls} 次`);
+      if (namedInStats !== true && namedInLogs !== true) violations.push(`${label}: 分级失败未被点名（静默放行原始失败）`);
+      // (D3 强形式) 终态错误是不是点名本插件的阶梯错误
+      strongMiss += 1;
+      witness ??= policy.join(",");
+    } else if (out.terminal === "REPORT") {
+      if (isNamedByPlugin(out.thrown) !== true) violations.push(`${label}: 抛错但没点名本插件`);
+    } else if (out.terminal === "DECLINE") {
+      violations.push(`${label}: 溢出失败却完全没分类（注入把分类器前置条件打断了）`);
+    } else {
+      violations.push(`${label}: 终态 ${out.terminal} 不在四元字母表内`);
+    }
+
+    for (const line of rig.boundary.logs) {
+      if (FAILURE_RE.test(line) !== true) continue;
+      const key = String(line).replace(/\d+/gu, "#").slice(0, 220);
+      if (bailReasons.has(key) !== true) bailReasons.set(key, String(line).replace(/\d+/gu, "#").slice(0, 220));
+    }
+  }
+
+  const rungDetail = [...rungSeen.entries()].map(([name, byOutcome]) => `${name}[${[...byOutcome.entries()].map(([o, v]) => `${o}:${v}`).join("/")}]`).join("、");
+  console.log(`  I12c 组合 ${policies.length} 个（Σ_inj^3 全额）；边界被触碰 ${touched} 个；终态分布 {${[...terminals.entries()].map(([k, v]) => `${k}:${v}`).join(", ")}}`);
+  console.log(`    逐级覆盖：进入阶梯 ${ladderRuns}、下降到第 2 级 ${ladderDescended}、各级提交数 {summary:${rungCommitted.summary}, prune:${rungCommitted.prune}, hardTrim:${rungCommitted.hardTrim}}`);
+  console.log(`    运行期枚举到的级名与结局：${rungDetail || "（无）"}`);
+  console.log(`    点名可观测 ${namedOk}/${policies.length}（只对失败/耗尽路径有意义：${propagated} 个）；前进 ${advanced}、放行原始失败（已点名）${propagated}`);
+  for (const line of [...bailReasons.values()].slice(0, 3)) console.log(`    降级链路实测：${line}`);
+
+  if (violations.length > 0) {
+    ctx.counterexamples.push(violations[0]);
+    fail(`I12c 终态纪律违反 ${violations.length} 处：\n           ${violations.slice(0, 5).join("\n           ")}`);
+  }
+  if (strongMiss > 0) {
+    WARNINGS.push(
+      `I12c (D3) 强形式：${strongMiss}/${policies.length} 个组合在三级耗尽后，回合终结错误是**原始 400** 而不是阶梯的点名错误` +
+        `（阶梯本身在 \`lib/engine.js:706\` 抛出 CompactionDoctorExhaustedError，被 \`lib/engine.js:380-382\` 吞掉，\`lib/engine.js:384\` 放行原始失败）。` +
+        `最短复现：注入 ${witness}。规格 §9.3(D3) 需定稿：强形式（抛出点名错误）还是弱形式（放行原始失败 + stats/日志点名，当前实现满足）。`,
+    );
+  }
+  return (
+    `${policies.length} 个逐级注入组合（边界被触碰 ${touched} 个）：进入阶梯 ${ladderRuns}、下降到第 2 级 ${ladderDescended}、` +
+    `各级提交 {summary:${rungCommitted.summary}, prune:${rungCommitted.prune}, hardTrim:${rungCommitted.hardTrim}}；` +
+    `终态 {${[...terminals.entries()].map(([k, v]) => `${k}:${v}`).join(", ")}}；前进 ${advanced}、放行原始失败但已点名 ${propagated}；` +
+    `(D1)(D2)(D4)(D5) 与 (D3 弱形式) 零违反` +
+    (strongMiss > 0 ? `；(D3 强形式) ${strongMiss} 个组合见告警` : "")
+  );
+});
+
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // §10 报告
